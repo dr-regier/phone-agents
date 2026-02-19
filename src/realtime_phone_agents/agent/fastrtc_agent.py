@@ -16,26 +16,30 @@ from realtime_phone_agents.tts import get_tts_model
 
 AudioChunk = Tuple[int, np.ndarray]  # (sample_rate, samples)
 
+DEFAULT_GREETING = (
+    "Hello this is Josie at Mile High Apartment Finders. Tell me what you are looking for and I'll help you find the perfect apartment in Denver."
+)
+
 DEFAULT_SYSTEM_PROMPT = """
-Your name is Lisa, and you are a real estate assistant working for The Neural Maze real estate company.
-Your role is to provide short, clear, concrete, and summarised information about apartments.
-You must use the search_property_tool whenever you need property details.
+Your name is Josie, and you are a real estate assistant working for Mile High Apartment Finders.
+Your role is to help callers find apartments to rent in Denver, Colorado.
+You must use the search_property_tool whenever you need to search for property details.
+All apartments are located in Denver, Colorado neighborhoods.
+All prices are monthly rent in US dollars.
 
-# Communication workflow:
-Always start introducing yourself and asking the user for their name and then ask them what they are looking for.
-
-# Communication rules:
+Communication rules:
 Use only plain text, suitable for phone transcription.
 Do not use emojis, asterisks, bullet points, or any special formatting.
 Write all numbers fully in words. For example, three instead of 3.
-Keep answers concise, friendly, and easy to follow. Don't exceed 1 line of text.
+When stating prices, say them as dollars per month. For example, twenty-one hundred dollars per month.
+Keep answers concise, friendly, and easy to follow.
+For the first query, provide results with limited detail about neighborhood, size, and price.
+Only list a maximum of three apartments at a time.
+For subsequent queries, provide more detailed information about the apartments.
 Provide only factual information that comes from the tool or from the user's input.
-
-# Property Search Rules:
-
-If the tool provides more than 1 property, just mention the first one and ask the user if they want to see more.
-Don't mention all the information about the properties, just the price, location and number of rooms and bathrooms in a friendly manner. Say things
-like: "I think I found your future appartment" or "I think I found the perfect appartment for you"
+When presenting multiple apartments, separate them with simple sentences, maintaining clarity and brevity.
+Be helpful. If the caller is interested in an apartment, offer to connect them with the leasing office to schedule a showing.
+If they are not ready for that, ask if they would like to hear more details or search for something different.
 """.strip()
 
 
@@ -59,6 +63,7 @@ class FastRTCAgent:
         fallback_message: str = "I'm sorry, I couldn't find anything useful in the system.",
         system_prompt: str | None = None,
         tools: List | None = None,
+        greeting_message: str = DEFAULT_GREETING,
     ):
         """
         Initialize the FastRTC agent with all its dependencies.
@@ -73,6 +78,7 @@ class FastRTCAgent:
             fallback_message: Message to return when no answer is found
             system_prompt: Custom system prompt for the agent
             tools: List of tools for the agent (defaults to property search tool)
+            greeting_message: Message to play when a call connects
         """
         # Dependency injection with sensible defaults
         self._stt_model = stt_model or get_stt_model(settings.stt_model)
@@ -90,6 +96,15 @@ class FastRTCAgent:
         self._fallback_message = fallback_message
         self._tool_use_message = tool_use_message
         self._sound_effect_seconds = sound_effect_seconds
+        self._greeting_message = greeting_message
+
+        # Pre-generate greeting audio chunks at startup so they play instantly on call connect
+        self._greeting_chunks = []
+        if greeting_message:
+            logger.info(f"Pre-generating greeting audio: {greeting_message}")
+            for chunk in self._tts_model.stream_tts_sync(greeting_message):
+                self._greeting_chunks.append(chunk)
+            logger.info(f"Greeting audio ready ({len(self._greeting_chunks)} chunks)")
 
         # Build the FastRTC Stream with the handler
         self._stream = self._build_stream()
@@ -125,6 +140,17 @@ class FastRTCAgent:
         )
         return agent
 
+    def _create_startup_fn(self):
+        """Create an async generator that yields pre-generated greeting audio chunks."""
+        greeting_chunks = self._greeting_chunks
+
+        async def greeting_fn():
+            logger.info(f"Playing greeting audio ({len(greeting_chunks)} chunks)")
+            for chunk in greeting_chunks:
+                yield chunk
+
+        return greeting_fn
+
     def _build_stream(self) -> Stream:
         """
         Build and configure the FastRTC Stream with the agent handler.
@@ -139,8 +165,10 @@ class FastRTCAgent:
             async for chunk in self._process_audio(audio):
                 yield chunk
 
+        startup_fn = self._create_startup_fn() if self._greeting_message else None
+
         return Stream(
-            handler=ReplyOnPause(handler_wrapper),
+            handler=ReplyOnPause(handler_wrapper, startup_fn=startup_fn),
             modality="audio",
             mode="send-receive",
         )

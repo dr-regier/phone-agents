@@ -35,10 +35,10 @@ class SuperlinkedSettings(BaseModel):
         default=2000, description="Maximum value for appartment size in square feet"
     )
     price_min_value: int = Field(
-        default=100000, description="Minimum value for appartment price in euros"
+        default=1000, description="Minimum value for apartment monthly rent in dollars"
     )
     price_max_value: int = Field(
-        default=10000000, description="Maximum value for appartment price in euros"
+        default=5000, description="Maximum value for apartment monthly rent in dollars"
     )
 
 
