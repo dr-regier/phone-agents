@@ -35,10 +35,10 @@ class SuperlinkedSettings(BaseModel):
         default=2000, description="Maximum value for appartment size in square feet"
     )
     price_min_value: int = Field(
-        default=100000, description="Minimum value for appartment price in euros"
+        default=350000, description="Minimum value for home purchase price in dollars"
     )
     price_max_value: int = Field(
-        default=10000000, description="Maximum value for appartment price in euros"
+        default=1500000, description="Maximum value for home purchase price in dollars"
     )
 
 
@@ -132,6 +132,10 @@ class Settings(BaseSettings):
     tts_model: str = Field(
         default="together",
         description="TTS model to use (kokoro, orpheus-runpod, together)",
+    )
+    avatar_name: str = Field(
+        default="leo",
+        description="Avatar name to use for the voice agent persona",
     )
 
     model_config: ClassVar[SettingsConfigDict] = SettingsConfigDict(

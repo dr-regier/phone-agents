@@ -2,6 +2,7 @@ from typing import AsyncIterator, List, Optional, Tuple
 
 import numpy as np
 from fastrtc import ReplyOnPause, Stream
+from fastrtc.utils import get_current_context
 from realtime_phone_agents.agent.stream import VoiceAgentStream
 from langchain.agents import create_agent
 from langchain_groq import ChatGroq
@@ -33,14 +34,14 @@ class FastRTCAgent:
 
     def __init__(
         self,
-        tool_use_message: str = "Let me look for that in the system",
+        tool_use_messages: list[str] | None = None,
         sound_effect_seconds: float = 3.0,
         stt_model=None,
         tts_model=None,
         voice_effect=None,
         thread_id: str = "default",
         fallback_message: str = "I'm sorry, I couldn't find anything useful in the system.",
-        avatar: str | None = "tara",
+        avatar: str | None = None,
         tools: List | None = None,
     ):
         """
@@ -68,7 +69,7 @@ class FastRTCAgent:
         self._tts_model = tts_model or get_tts_model(settings.tts_model)
         self._voice_effect = voice_effect or get_sound_effect()
 
-        self._avatar = get_avatar(avatar)
+        self._avatar = get_avatar(avatar or settings.avatar_name)
 
         # Create the React agent directly inside the class
         self._react_agent = self._create_react_agent(
@@ -79,8 +80,17 @@ class FastRTCAgent:
         # Configuration - stored as instance variables to avoid gradio additional_inputs
         self._thread_id = thread_id
         self._fallback_message = fallback_message
-        self._tool_use_message = tool_use_message
         self._sound_effect_seconds = sound_effect_seconds
+
+        # Rotating tool use messages so the caller doesn't hear the same phrase every time
+        self._tool_use_messages = tool_use_messages or [
+            "Let me pull that up for you.",
+            "Sure, let me search our listings.",
+            "One moment while I look into that.",
+            "Let me see what we have.",
+            "Good question, let me check on that.",
+        ]
+        self._tool_use_count = 0
 
         # Build the FastRTC Stream with the handler
         self._stream = self._build_stream()
@@ -152,6 +162,20 @@ class FastRTCAgent:
             Audio chunks to be played back to the user
         """
 
+        # Use FastRTC's per-connection context as thread ID so each call is isolated
+        try:
+            context = get_current_context()
+            if context.webrtc_id != self._thread_id:
+                self._thread_id = context.webrtc_id
+                self._opik_tracer = OpikTracer(
+                    tags=["fastrtc-agent", "realtime-phone"],
+                    thread_id=self._thread_id,
+                )
+                self._tool_use_count = 0
+                logger.info(f"New call session: {self._thread_id}")
+        except Exception:
+            pass  # Fall back to existing thread_id if context unavailable
+
         # Step 1: Transcribe audio to text
         transcription = await self._transcribe(audio)
         logger.info(f"Transcription: {transcription}")
@@ -211,10 +235,10 @@ class FastRTCAgent:
             for step, data in chunk.items():
                 # Handle tool calls
                 if step == "model" and model_has_tool_calls(data):
-                    # Speak tool-use message
-                    async for audio_chunk in self._synthesize_speech(
-                        self._tool_use_message
-                    ):
+                    # Speak rotating tool-use message
+                    message = self._tool_use_messages[self._tool_use_count % len(self._tool_use_messages)]
+                    self._tool_use_count += 1
+                    async for audio_chunk in self._synthesize_speech(message):
                         yield audio_chunk
 
                     # Play sound effect
@@ -337,15 +361,6 @@ class FastRTCAgent:
             message: New fallback message
         """
         self._fallback_message = message
-
-    def set_tool_use_message(self, message: str) -> None:
-        """
-        Update the tool use message.
-
-        Args:
-            message: New tool use message
-        """
-        self._tool_use_message = message
 
     def set_sound_effect_seconds(self, seconds: float) -> None:
         """

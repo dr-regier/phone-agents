@@ -47,7 +47,7 @@ class TogetherTTSModel(TTSModel):
     # Audio format constants
     CHANNELS = 1  # Mono audio
     BITS_PER_SAMPLE = 16  # 16-bit PCM
-    MIN_CHUNK_SIZE = 1024  # 512 samples (about 21ms at 24kHz)
+    MIN_CHUNK_SIZE = 1024  # Minimum bytes before yielding a chunk
 
     def __init__(self, options: TogetherTTSOptions | None = None):
         """

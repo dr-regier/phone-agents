@@ -8,6 +8,7 @@ services:
       - "8000:8000"
     volumes:
       - ./data:/app/data
+      - ./src/realtime_phone_agents:/app/realtime_phone_agents
       - sentence_transformers_cache:/root/.cache/huggingface
     env_file:
       - .env
