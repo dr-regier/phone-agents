@@ -8,6 +8,7 @@ from realtime_phone_agents.config import settings
 DEFAULT_VOICES = {
     "canopylabs/orpheus-3b-0.1-ft": "tara",
     "hexgrad/Kokoro-82M": "af_heart",
+    "cartesia/sonic-3": "customer support man",
     "cartesia/sonic-2": "sarah",
     "cartesia/sonic": "sarah",
 }

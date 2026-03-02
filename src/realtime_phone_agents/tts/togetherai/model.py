@@ -110,71 +110,41 @@ class TogetherTTSModel(TTSModel):
             "model": options.model,
             "input": text.strip(),
             "voice": options.voice,
-            "stream": True,
-            "response_format": "raw",  # Required for streaming
-            "response_encoding": "pcm_s16le",  # 16-bit PCM for clean audio
+            "stream": False,
+            "response_format": "raw",
+            "response_encoding": "pcm_s16le",
             "sample_rate": options.sample_rate,
         }
 
-        logger.info(f"📤 Sending {len(text)} chars to Together AI TTS API...")
-
-        chunks_received = 0
-        total_bytes = 0
-        pcm_buffer = b""
+        logger.info(f"📤 Sending {len(text)} chars to Together AI TTS API (non-streaming)...")
 
         try:
             with httpx.Client(
                 timeout=httpx.Timeout(300.0, connect=10.0),
                 headers=self._get_headers(),
             ) as client:
-                with client.stream("POST", speech_url, json=payload) as response:
-                    response.raise_for_status()
+                response = client.post(speech_url, json=payload)
+                response.raise_for_status()
 
-                    content_type = response.headers.get("content-type", "")
-                    logger.debug(f"📥 Response content-type: {content_type}")
+                content_type = response.headers.get("content-type", "")
+                raw_bytes = response.content
+                logger.info(
+                    f"📥 Response: content-type={content_type}, {len(raw_bytes)} bytes"
+                )
 
-                    for chunk in response.iter_bytes():
-                        if not chunk:
-                            continue
-
-                        pcm_buffer += chunk
-
-                        # Send complete 2-byte aligned chunks (int16 = 2 bytes per sample)
-                        if len(pcm_buffer) >= self.MIN_CHUNK_SIZE:
-                            complete_samples = len(pcm_buffer) // 2
-                            if complete_samples > 0:
-                                complete_bytes = complete_samples * 2
-                                chunks_received += 1
-                                total_bytes += complete_bytes
-
-                                audio_chunk = np.frombuffer(
-                                    pcm_buffer[:complete_bytes], dtype=np.int16
-                                )
-
-                                if chunks_received == 1:
-                                    logger.debug(
-                                        f"🎵 First audio chunk: {complete_bytes} bytes"
-                                    )
-
-                                yield audio_chunk
-                                pcm_buffer = pcm_buffer[complete_bytes:]
-
-                    # Flush remaining buffer
-                    if pcm_buffer:
-                        complete_samples = len(pcm_buffer) // 2
-                        if complete_samples > 0:
-                            complete_bytes = complete_samples * 2
-                            chunks_received += 1
-                            total_bytes += complete_bytes
-
-                            audio_chunk = np.frombuffer(
-                                pcm_buffer[:complete_bytes], dtype=np.int16
-                            )
-                            yield audio_chunk
-
-            logger.info(
-                f"✅ Together AI TTS completed: {chunks_received} chunks, {total_bytes} bytes"
-            )
+                # Parse raw PCM bytes into int16 chunks
+                complete_samples = len(raw_bytes) // 2
+                if complete_samples > 0:
+                    complete_bytes = complete_samples * 2
+                    audio_chunk = np.frombuffer(
+                        raw_bytes[:complete_bytes], dtype=np.int16
+                    )
+                    logger.info(
+                        f"✅ Together AI TTS completed: {complete_bytes} bytes, "
+                        f"{complete_samples} samples, "
+                        f"~{complete_samples / options.sample_rate:.2f}s at {options.sample_rate}Hz"
+                    )
+                    yield audio_chunk
 
         except httpx.HTTPStatusError as e:
             error_msg = f"❌ Together AI TTS API error: {e.response.status_code}"
