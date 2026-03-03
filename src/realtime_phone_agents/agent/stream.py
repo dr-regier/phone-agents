@@ -84,7 +84,7 @@ class VoiceAgentStream(Stream):
         from twilio.twiml.voice_response import Connect, VoiceResponse
 
         response = VoiceResponse()
-        response.say("Connecting to the AI assistant.")
+        response.say("One moment.")
         connect = Connect()
         
         # Get hostname from X-Forwarded-Host header (if behind proxy) or fallback to request hostname

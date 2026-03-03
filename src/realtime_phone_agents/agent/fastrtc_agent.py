@@ -1,7 +1,9 @@
+import re
 from typing import AsyncIterator, List, Optional, Tuple
 
 import numpy as np
 from fastrtc import ReplyOnPause, Stream
+from fastrtc.reply_on_pause import AlgoOptions
 from fastrtc.utils import get_current_context
 from realtime_phone_agents.agent.stream import VoiceAgentStream
 from langchain.agents import create_agent
@@ -92,8 +94,28 @@ class FastRTCAgent:
         ]
         self._tool_use_count = 0
 
+        # Pre-generate greeting audio at startup so callers hear Leo immediately
+        self._greeting_audio = self._generate_greeting()
+
         # Build the FastRTC Stream with the handler
         self._stream = self._build_stream()
+
+    def _generate_greeting(self) -> AudioChunk | None:
+        """Pre-generate the avatar's greeting audio at startup for instant playback."""
+        greeting_text = (
+            f"Hey there, this is {self._avatar.name} with Mile High Home Finders. "
+            "Thanks for calling! How can I help you today?"
+        )
+        try:
+            logger.info(f"Pre-generating greeting audio: {greeting_text!r}")
+            sample_rate, audio = self._tts_model.tts(greeting_text)
+            logger.info(
+                f"Greeting audio cached: {len(audio)} samples at {sample_rate}Hz"
+            )
+            return (sample_rate, audio)
+        except Exception as e:
+            logger.error(f"Failed to pre-generate greeting audio: {e}")
+            return None
 
     def _create_react_agent(
         self,
@@ -133,14 +155,30 @@ class FastRTCAgent:
         Returns:
             Configured Stream instance
         """
+        greeting_audio = self._greeting_audio
 
         async def handler_wrapper(audio: AudioChunk) -> AsyncIterator[AudioChunk]:
             """Handler that uses instance variables directly."""
             async for chunk in self._process_audio(audio):
                 yield chunk
 
+        async def greeting_startup():
+            """Yield cached greeting audio on WebSocket connect."""
+            if greeting_audio is not None:
+                yield greeting_audio
+
+        startup_fn = greeting_startup if greeting_audio is not None else None
+
         return VoiceAgentStream(
-            handler=ReplyOnPause(handler_wrapper),
+            handler=ReplyOnPause(
+                handler_wrapper,
+                startup_fn=startup_fn,
+                algo_options=AlgoOptions(
+                    audio_chunk_duration=0.6,
+                    started_talking_threshold=0.2,
+                    speech_threshold=0.3,
+                ),
+            ),
             modality="audio",
             mode="send-receive",
         )
@@ -222,7 +260,8 @@ class FastRTCAgent:
             Audio chunks for tool use messages and effects
         """
         final_text: str | None = None
-        
+        spoke_tool_message = False
+
         # Stream LangChain agent updates with Opik tracing
         async for chunk in self._react_agent.astream(
             {"messages": [{"role": "user", "content": transcription}]},
@@ -233,21 +272,33 @@ class FastRTCAgent:
             stream_mode="updates",
         ):
             for step, data in chunk.items():
-                # Handle tool calls
+                # Handle tool calls — only speak on the first tool call in
+                # this turn so the caller doesn't hear repeated messages
+                # when the LLM chains multiple searches.
                 if step == "model" and model_has_tool_calls(data):
-                    # Speak rotating tool-use message
-                    message = self._tool_use_messages[self._tool_use_count % len(self._tool_use_messages)]
-                    self._tool_use_count += 1
-                    async for audio_chunk in self._synthesize_speech(message):
-                        yield audio_chunk
+                    if not spoke_tool_message:
+                        spoke_tool_message = True
+                        # If the LLM included text alongside the tool call,
+                        # speak that instead of a canned message so the
+                        # conversation flows naturally before the search.
+                        model_text = self._extract_final_text(data)
+                        if model_text and model_text.strip():
+                            message = model_text.strip()
+                        else:
+                            message = self._tool_use_messages[self._tool_use_count % len(self._tool_use_messages)]
+                        self._tool_use_count += 1
+                        async for audio_chunk in self._synthesize_speech(message):
+                            yield audio_chunk
 
-                    # Play sound effect
-                    if self._sound_effect_seconds > 0:
-                        async for effect_chunk in self._play_sound_effect():
-                            yield effect_chunk
+                        # Play sound effect
+                        if self._sound_effect_seconds > 0:
+                            async for effect_chunk in self._play_sound_effect():
+                                yield effect_chunk
 
-                # Capture final text from model response
-                if step == "model":
+                # Capture final text only from model steps without tool calls.
+                # Tool-call steps may have preamble text (e.g. "let me check")
+                # that we already spoke above — don't repeat it as the final answer.
+                if step == "model" and not model_has_tool_calls(data):
                     final_text = self._extract_final_text(data)
 
         # Store final text for later retrieval
@@ -284,10 +335,25 @@ class FastRTCAgent:
         """
         return getattr(self, "_last_final_text", None) or self._fallback_message
 
+    @staticmethod
+    def _split_sentences(text: str) -> list[str]:
+        """Split text into sentences for incremental TTS.
+
+        Splits on sentence-ending punctuation (.!?) followed by a space,
+        keeping each sentence as a separate string so the first sentence
+        can be synthesized and played while subsequent ones are still
+        generating.
+        """
+        parts = re.split(r'(?<=[.!?])\s+', text.strip())
+        return [p for p in parts if p]
+
     @opik.track(name="tts-generation", capture_input=True, capture_output=False)
     async def _synthesize_speech(self, text: str) -> AsyncIterator[AudioChunk]:
         """
         Convert text to speech audio chunks.
+
+        Splits text into sentences and synthesizes each one separately so the
+        caller hears the first sentence while later ones are still generating.
 
         Args:
             text: Text to synthesize
@@ -295,8 +361,10 @@ class FastRTCAgent:
         Yields:
             Audio chunks
         """
-        async for audio_chunk in self._tts_model.stream_tts(text):
-            yield audio_chunk
+        sentences = self._split_sentences(text)
+        for sentence in sentences:
+            async for audio_chunk in self._tts_model.stream_tts(sentence):
+                yield audio_chunk
 
     @opik.track(name="play-sound-effect", capture_input=False, capture_output=False)
     async def _play_sound_effect(self) -> AsyncIterator[AudioChunk]:
