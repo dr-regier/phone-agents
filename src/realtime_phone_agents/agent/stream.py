@@ -9,7 +9,8 @@ from fastrtc.utils import RTCConfigurationCallable
 
 
 class VoiceAgentStream(Stream):
-    
+    _caller_phone: str | None = None
+
     def __init__(
         self,
         handler: HandlerType,
@@ -82,6 +83,10 @@ class VoiceAgentStream(Stream):
             An HTMLResponse containing the TwiML instructions as XML.
         """
         from twilio.twiml.voice_response import Connect, VoiceResponse
+
+        form = await request.form()
+        self._caller_phone = form.get("From")
+        logger.info(f"Incoming call from: {self._caller_phone}")
 
         response = VoiceResponse()
         response.say("One moment.")

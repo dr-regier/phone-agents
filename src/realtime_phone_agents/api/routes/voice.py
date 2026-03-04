@@ -4,6 +4,7 @@ from fastapi import APIRouter, FastAPI, HTTPException
 from twilio.rest import Client
 
 from realtime_phone_agents.agent.fastrtc_agent import FastRTCAgent
+from realtime_phone_agents.agent.tools.sms import create_send_sms_tool
 from realtime_phone_agents.api.models import CallRequest
 from realtime_phone_agents.config import settings
 
@@ -48,6 +49,10 @@ def mount_voice_stream(app: FastAPI):
     agent = FastRTCAgent(
         thread_id=str(uuid4()),
     )
+
+    # Create SMS tool bound to the agent's stream so it can read _caller_phone
+    send_sms_tool = create_send_sms_tool(agent.stream)
+    agent.add_tool(send_sms_tool)
 
     # Mount Websocket endpoint for Twilio Integration
     agent.stream.mount(app, path="/voice")

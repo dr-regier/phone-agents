@@ -73,10 +73,13 @@ class FastRTCAgent:
 
         self._avatar = get_avatar(avatar or settings.avatar_name)
 
+        # Track tools list for add_tool() support
+        self._tools = list(tools) if tools else [search_property_tool]
+
         # Create the React agent directly inside the class
         self._react_agent = self._create_react_agent(
             system_prompt=self._avatar.get_system_prompt(),
-            tools=tools,
+            tools=self._tools,
         )
 
         # Configuration - stored as instance variables to avoid gradio additional_inputs
@@ -420,6 +423,21 @@ class FastRTCAgent:
             thread_id: New thread ID
         """
         self._thread_id = thread_id
+
+    def add_tool(self, tool) -> None:
+        """Add a tool to the agent and rebuild the React agent with the updated tool list.
+
+        This is useful for tools that need a reference to the stream instance
+        (e.g. SMS tool), which isn't available until after __init__ completes.
+
+        Args:
+            tool: A LangChain tool to add
+        """
+        self._tools.append(tool)
+        self._react_agent = self._create_react_agent(
+            system_prompt=self._avatar.get_system_prompt(),
+            tools=self._tools,
+        )
 
     def set_fallback_message(self, message: str) -> None:
         """

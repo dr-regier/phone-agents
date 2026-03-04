@@ -110,6 +110,7 @@ class OpikSettings(BaseModel):
 class TwilioSettings(BaseModel):
     account_sid: str = Field(default="", description="Twilio Account SID")
     auth_token: str = Field(default="", description="Twilio Auth Token")
+    phone_number: str = Field(default="", description="Twilio phone number (E.164 format, e.g. +1XXXXXXXXXX)")
 
 
 # --- Settings Configuration ---
