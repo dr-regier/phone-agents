@@ -15,7 +15,7 @@ from opik import opik_context
 import opik
 
 from realtime_phone_agents.agent.tools.property_search import search_property_tool
-from realtime_phone_agents.agent.utils import model_has_tool_calls
+from realtime_phone_agents.agent.utils import get_tool_call_names, model_has_tool_calls
 from realtime_phone_agents.background_effects import get_sound_effect
 from realtime_phone_agents.config import settings
 from realtime_phone_agents.stt import get_stt_model
@@ -76,6 +76,9 @@ class FastRTCAgent:
         # Track tools list for add_tool() support
         self._tools = list(tools) if tools else [search_property_tool]
 
+        # Single checkpointer shared across agent rebuilds to preserve conversation history
+        self._checkpointer = InMemorySaver()
+
         # Create the React agent directly inside the class
         self._react_agent = self._create_react_agent(
             system_prompt=self._avatar.get_system_prompt(),
@@ -96,6 +99,8 @@ class FastRTCAgent:
             "Good question, let me check on that.",
         ]
         self._tool_use_count = 0
+        self._turn_count = 0
+        self._max_turns = 15  # ~5 min of conversation, start wrapping up at max_turns - 3
 
         # Pre-generate greeting audio at startup so callers hear Leo immediately
         self._greeting_audio = self._generate_greeting()
@@ -105,10 +110,11 @@ class FastRTCAgent:
 
     def _generate_greeting(self) -> AudioChunk | None:
         """Pre-generate the avatar's greeting audio at startup for instant playback."""
-        greeting_text = (
+        self._greeting_text = (
             f"Hey there, this is {self._avatar.name} with Mile High Home Finders. "
             "Thanks for calling! How can I help you today?"
         )
+        greeting_text = self._greeting_text
         try:
             logger.info(f"Pre-generating greeting audio: {greeting_text!r}")
             sample_rate, audio = self._tts_model.tts(greeting_text)
@@ -144,7 +150,7 @@ class FastRTCAgent:
 
         agent = create_agent(
             llm,
-            checkpointer=InMemorySaver(),
+            checkpointer=self._checkpointer,
             system_prompt=system_prompt,
             tools=tools,
         )
@@ -213,13 +219,49 @@ class FastRTCAgent:
                     thread_id=self._thread_id,
                 )
                 self._tool_use_count = 0
+                self._turn_count = 0
                 logger.info(f"New call session: {self._thread_id}")
+
+                # Seed the greeting into conversation history so the LLM
+                # knows it already introduced itself and won't repeat it.
+                if hasattr(self, "_greeting_text") and self._greeting_text:
+                    await self._react_agent.ainvoke(
+                        {"messages": [{"role": "assistant", "content": self._greeting_text}]},
+                        {"configurable": {"thread_id": self._thread_id}},
+                    )
+                    logger.info("Seeded greeting into conversation history")
         except Exception:
             pass  # Fall back to existing thread_id if context unavailable
 
         # Step 1: Transcribe audio to text
         transcription = await self._transcribe(audio)
         logger.info(f"Transcription: {transcription}")
+
+        # Track turns and enforce call limits
+        self._turn_count += 1
+        logger.info(f"Turn {self._turn_count}/{self._max_turns}")
+
+        if self._turn_count > self._max_turns:
+            # Hard cutoff — politely end the call, then hang up
+            goodbye = (
+                "I've really enjoyed chatting with you, but I need to wrap up. "
+                "Feel free to call back anytime. Have a great day!"
+            )
+            async for audio_chunk in self._synthesize_speech(goodbye):
+                yield audio_chunk
+            # Actually disconnect the call via Twilio
+            if isinstance(self._stream, VoiceAgentStream):
+                self._stream.hang_up()
+            return
+
+        # Inject wrap-up nudge when approaching the limit
+        if self._turn_count == self._max_turns - 2:
+            transcription += (
+                "\n\n[SYSTEM: This call is approaching the time limit. "
+                "Start wrapping up naturally — summarize any next steps, "
+                "offer to send details via SMS if a showing was scheduled, "
+                "and say goodbye warmly.]"
+            )
 
         # Step 2: Process with agent and stream responses
         async for audio_chunk in self._process_with_agent(transcription):
@@ -279,6 +321,9 @@ class FastRTCAgent:
                 # this turn so the caller doesn't hear repeated messages
                 # when the LLM chains multiple searches.
                 if step == "model" and model_has_tool_calls(data):
+                    tool_names = get_tool_call_names(data)
+                    is_sms = any(n == "send_sms" for n in tool_names)
+
                     if not spoke_tool_message:
                         spoke_tool_message = True
                         # If the LLM included text alongside the tool call,
@@ -287,14 +332,16 @@ class FastRTCAgent:
                         model_text = self._extract_final_text(data)
                         if model_text and model_text.strip():
                             message = model_text.strip()
+                        elif is_sms:
+                            message = "Sending that over to you now."
                         else:
                             message = self._tool_use_messages[self._tool_use_count % len(self._tool_use_messages)]
                         self._tool_use_count += 1
                         async for audio_chunk in self._synthesize_speech(message):
                             yield audio_chunk
 
-                        # Play sound effect
-                        if self._sound_effect_seconds > 0:
+                        # Play sound effect (skip for SMS — it's near-instant)
+                        if self._sound_effect_seconds > 0 and not is_sms:
                             async for effect_chunk in self._play_sound_effect():
                                 yield effect_chunk
 
@@ -436,6 +483,17 @@ class FastRTCAgent:
         self._tools.append(tool)
         self._react_agent = self._create_react_agent(
             system_prompt=self._avatar.get_system_prompt(),
+            tools=self._tools,
+        )
+
+    def set_caller_phone(self, phone: str) -> None:
+        """Rebuild the react agent with the caller's phone number injected into the system prompt.
+
+        Called when a new inbound call arrives so the LLM knows the caller's actual number.
+        """
+        logger.info(f"Rebuilding agent with caller phone: {phone}")
+        self._react_agent = self._create_react_agent(
+            system_prompt=self._avatar.get_system_prompt(caller_phone=phone),
             tools=self._tools,
         )
 

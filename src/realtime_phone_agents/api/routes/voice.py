@@ -54,5 +54,8 @@ def mount_voice_stream(app: FastAPI):
     send_sms_tool = create_send_sms_tool(agent.stream)
     agent.add_tool(send_sms_tool)
 
+    # When a call arrives, rebuild the agent prompt with the caller's phone number
+    agent.stream._on_caller_phone = agent.set_caller_phone
+
     # Mount Websocket endpoint for Twilio Integration
     agent.stream.mount(app, path="/voice")

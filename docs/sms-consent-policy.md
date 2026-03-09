@@ -2,6 +2,21 @@
 
 When you call Mile High Home Finders, our AI assistant Leo may offer to text you property details discussed during the call. SMS messages are only sent when you verbally request them during a live phone conversation.
 
+## Verbal Consent Script
+
+SMS is only offered after a showing has been scheduled. The following is the verbal consent exchange that occurs during the live phone call:
+
+**Agent (Leo):**
+"I can text you the showing details so you have everything handy. Would you like me to send that to your phone?"
+
+**If the caller says yes:**
+"Great, I have your number as [reads back caller's phone number]. Should I send the details there?"
+
+The caller must verbally confirm a second time before any SMS is sent. If the caller provides a different number, Leo reads back the new number for confirmation before sending.
+
+**If the caller says no at any point:**
+No SMS is sent. Leo continues the conversation without further SMS prompts.
+
 ## Opt-In
 
 By verbally confirming you'd like to receive a text during your call, you consent to receiving an SMS with property information at the phone number you're calling from (or an alternate number you provide).

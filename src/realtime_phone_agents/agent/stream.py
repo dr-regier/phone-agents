@@ -8,8 +8,28 @@ from fastrtc.tracks import HandlerType
 from fastrtc.utils import RTCConfigurationCallable
 
 
+MAX_CALL_DURATION_SECONDS = 300  # 5 minutes — hard cutoff at Twilio level
+
+
 class VoiceAgentStream(Stream):
     _caller_phone: str | None = None
+    _call_sid: str | None = None
+    _on_caller_phone: Callable[[str], None] | None = None
+
+    def hang_up(self) -> None:
+        """Terminate the active call via Twilio REST API."""
+        from twilio.rest import Client
+        from realtime_phone_agents.config import settings
+
+        if not self._call_sid:
+            logger.warning("hang_up called but no active CallSid")
+            return
+        try:
+            client = Client(settings.twilio.account_sid, settings.twilio.auth_token)
+            client.calls(self._call_sid).update(status="completed")
+            logger.info(f"Hung up call {self._call_sid}")
+        except Exception as e:
+            logger.error(f"Failed to hang up call {self._call_sid}: {e}")
 
     def __init__(
         self,
@@ -84,12 +104,28 @@ class VoiceAgentStream(Stream):
         """
         from twilio.twiml.voice_response import Connect, VoiceResponse
 
+        from twilio.rest import Client
+        from realtime_phone_agents.config import settings
+
         form = await request.form()
         self._caller_phone = form.get("From")
-        logger.info(f"Incoming call from: {self._caller_phone}")
+        self._call_sid = form.get("CallSid")
+        logger.info(f"Incoming call from: {self._caller_phone} (SID: {self._call_sid})")
+
+        if self._caller_phone and self._on_caller_phone:
+            self._on_caller_phone(self._caller_phone)
+
+        # Set hard time limit on the call via Twilio REST API
+        if self._call_sid and settings.twilio.account_sid and settings.twilio.auth_token:
+            try:
+                client = Client(settings.twilio.account_sid, settings.twilio.auth_token)
+                client.calls(self._call_sid).update(time_limit=MAX_CALL_DURATION_SECONDS)
+                logger.info(f"Set call time limit to {MAX_CALL_DURATION_SECONDS}s")
+            except Exception as e:
+                logger.warning(f"Failed to set call time limit: {e}")
 
         response = VoiceResponse()
-        response.say("One moment.")
+        response.say("One moment please.")
         connect = Connect()
         
         # Get hostname from X-Forwarded-Host header (if behind proxy) or fallback to request hostname
