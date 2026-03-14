@@ -21,12 +21,12 @@ def create_send_sms_tool(stream):
 
     @tool
     def send_sms(message: str, phone_number: str | None = None) -> str:
-        """Send an SMS text message to the caller.
-
-        Use this tool to text property details, links, or follow-up information
-        to the person on the phone. The caller's number is captured automatically
-        from the incoming call, but you can override it if they ask you to send
-        to a different number.
+        """Send an SMS with showing details ONLY after BOTH conditions are met:
+        1. A showing has been scheduled (date and time confirmed).
+        2. The caller explicitly agreed to receive a text.
+        Do NOT call this tool before both conditions are satisfied.
+        The caller's number is captured automatically from the incoming call,
+        but you can override it if they ask you to send to a different number.
 
         Args:
             message: The text content to send. Keep it concise and readable.

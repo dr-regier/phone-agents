@@ -220,16 +220,8 @@ class FastRTCAgent:
                 )
                 self._tool_use_count = 0
                 self._turn_count = 0
+                self._greeting_seeded = False
                 logger.info(f"New call session: {self._thread_id}")
-
-                # Seed the greeting into conversation history so the LLM
-                # knows it already introduced itself and won't repeat it.
-                if hasattr(self, "_greeting_text") and self._greeting_text:
-                    await self._react_agent.ainvoke(
-                        {"messages": [{"role": "assistant", "content": self._greeting_text}]},
-                        {"configurable": {"thread_id": self._thread_id}},
-                    )
-                    logger.info("Seeded greeting into conversation history")
         except Exception:
             pass  # Fall back to existing thread_id if context unavailable
 
@@ -307,9 +299,20 @@ class FastRTCAgent:
         final_text: str | None = None
         spoke_tool_message = False
 
+        # On the first turn, prepend the greeting as an AI message so the LLM
+        # knows it already introduced itself. This avoids ainvoke (which runs
+        # the full graph and can hallucinate tool calls) and aupdate_state
+        # (which can corrupt graph routing state).
+        messages = []
+        if not getattr(self, "_greeting_seeded", True) and self._greeting_text:
+            messages.append({"role": "assistant", "content": self._greeting_text})
+            self._greeting_seeded = True
+            logger.info("Prepended greeting to first turn messages")
+        messages.append({"role": "user", "content": transcription})
+
         # Stream LangChain agent updates with Opik tracing
         async for chunk in self._react_agent.astream(
-            {"messages": [{"role": "user", "content": transcription}]},
+            {"messages": messages},
             {
                 "configurable": {"thread_id": self._thread_id},
                 "callbacks": [self._opik_tracer]
