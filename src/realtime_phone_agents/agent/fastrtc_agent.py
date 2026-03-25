@@ -100,7 +100,7 @@ class FastRTCAgent:
         ]
         self._tool_use_count = 0
         self._turn_count = 0
-        self._max_turns = 15  # ~5 min of conversation, start wrapping up at max_turns - 3
+        self._max_turns = 20  # ~7 min of conversation, start wrapping up at max_turns - 2
 
         # Pre-generate greeting audio at startup so callers hear Leo immediately
         self._greeting_audio = self._generate_greeting()
