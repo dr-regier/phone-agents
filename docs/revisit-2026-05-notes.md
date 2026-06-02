@@ -7,6 +7,27 @@
 
 ---
 
+## ▶ START HERE NEXT SESSION (last worked: Jun 1 2026)
+
+**Done & shipped (on `main`, pushed to `backup`):**
+- ✅ Repetition bug fixed + validated in-call (commit `b94dbcf`). See Jun 1 update below.
+
+**Open, in priority order:**
+1. **Call-answer latency (18-35s) - biggest user-facing issue.** Diagnosed to the
+   FastRTC→Twilio transport (our greeting emits in ~0.1s; the dead air is downstream,
+   startup-only). NOT fixable in Leo's code. **Next step:** pick one - (A) instrument
+   fastrtc `_emit_loop` (queue depth + per-chunk send timestamps), or (B) browser A/B
+   via FastRTC's WebRTC test UI (bypasses Twilio + ngrok) to convict/exonerate ngrok.
+   Full context: Jun 1 update below + memory `leo-answer-latency-in-transport`.
+2. **Per-turn latency:** TTS variance (1.7-12s) is the main per-turn dead air; property
+   search regressed to 5-14s (was ~4s); occasional ~6.8s LLM spike (try `reasoning_effort="low"`).
+
+**To get running again:** `DOCKER_API_VERSION=1.41 docker compose up -d` (NOT `--build`,
+it hangs - existing image is fine), wait for `/health`, then POST `/superlinked/ingest`.
+Trace tool: `/tmp/analyze_calls.py` (copy into container, run with `/app/.venv/bin/python`).
+
+---
+
 ## TL;DR
 
 - **Baseline is healthy.** Full pipeline verified end to end, including a real phone call
