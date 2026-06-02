@@ -1,4 +1,5 @@
 import re
+import time
 from typing import AsyncIterator, List, Optional, Tuple
 
 import numpy as np
@@ -144,6 +145,19 @@ class FastRTCAgent:
         llm = ChatGroq(
             model=settings.groq.model,
             api_key=settings.groq.api_key,
+            # Anti-repetition: traces showed the model degenerating into multi-turn
+            # restatements on scheduling/confirmation turns (it role-played both sides
+            # of the conversation in one reply). frequency_penalty is the primary lever
+            # (directly penalizes repeated tokens) and lower temperature reduces the
+            # odds of degenerating into a loop. max_tokens is only a runaway backstop:
+            # gpt-oss is a reasoning model whose reasoning tokens count toward this cap,
+            # so it is set high enough to never truncate a real answer (a full property
+            # readout ~130 tokens + reasoning ~150) while still stopping infinite output.
+            temperature=0.5,
+            max_tokens=512,
+            model_kwargs={
+                "frequency_penalty": 0.6,
+            },
         )
 
         tools = tools or [search_property_tool]
@@ -174,7 +188,9 @@ class FastRTCAgent:
         async def greeting_startup():
             """Yield cached greeting audio on WebSocket connect."""
             if greeting_audio is not None:
+                logger.info("⏱️ greeting_startup entered, emitting cached greeting audio now")
                 yield greeting_audio
+                logger.info("⏱️ greeting audio emitted to caller")
 
         startup_fn = greeting_startup if greeting_audio is not None else None
 
@@ -392,13 +408,15 @@ class FastRTCAgent:
     def _split_sentences(text: str) -> list[str]:
         """Split text into sentences for incremental TTS.
 
-        Splits on sentence-ending punctuation (.!?) followed by a space,
-        keeping each sentence as a separate string so the first sentence
-        can be synthesized and played while subsequent ones are still
-        generating.
+        Splits on sentence-ending punctuation (.!?) followed by a space, plus a
+        run-on guard: ? or ! immediately followed by a capital letter (no space).
+        Traces showed the model joining restatements as "...works for you?Sounds
+        good..." which dodged the space-based split and played as one long breath.
+        We deliberately do NOT split a bare "." without a space, to protect
+        "p.m.", decimals, and abbreviations.
         """
-        parts = re.split(r'(?<=[.!?])\s+', text.strip())
-        return [p for p in parts if p]
+        parts = re.split(r'(?<=[.!?])\s+|(?<=[?!])(?=[A-Z])', text.strip())
+        return [p.strip() for p in parts if p.strip()]
 
     @opik.track(name="tts-generation", capture_input=True, capture_output=False)
     async def _synthesize_speech(self, text: str) -> AsyncIterator[AudioChunk]:
@@ -494,11 +512,13 @@ class FastRTCAgent:
 
         Called when a new inbound call arrives so the LLM knows the caller's actual number.
         """
-        logger.info(f"Rebuilding agent with caller phone: {phone}")
+        logger.info(f"⏱️ set_caller_phone START - rebuilding agent with caller phone: {phone}")
+        _t0 = time.monotonic()
         self._react_agent = self._create_react_agent(
             system_prompt=self._avatar.get_system_prompt(caller_phone=phone),
             tools=self._tools,
         )
+        logger.info(f"⏱️ set_caller_phone DONE - rebuild took {time.monotonic() - _t0:.2f}s")
 
     def set_fallback_message(self, message: str) -> None:
         """
