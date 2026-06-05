@@ -125,7 +125,6 @@ class VoiceAgentStream(Stream):
                 logger.warning(f"Failed to set call time limit: {e}")
 
         response = VoiceResponse()
-        response.say("One moment please.")
         connect = Connect()
         
         # Get hostname from X-Forwarded-Host header (if behind proxy) or fallback to request hostname
