@@ -11,22 +11,33 @@
 
 **Done & shipped (on `main`, pushed to `backup`):**
 - ✅ Repetition bug fixed + validated in-call (commit `b94dbcf`). See Jun 1 update below.
+- ✅ **Answer-latency (18-35s dead air) FIXED + validated 5/5 calls (commit `24c425c`).** It was NOT
+  ngrok/Twilio (3-session theory DISPROVEN) - it was fastrtc emit-queue starvation. Producer
+  `_emit_to_queue` spun on `emit()==None`, flooding an unbounded queue (164k items) and starving the
+  consumer from sending the greeting (sat at queue head from +0.1s but not pulled for 18.6s). Fix:
+  20ms idle backoff + skip the None enqueue, as a monkeypatch in `observability/emit_instrument.py`
+  installed from `api/main.py`. EMIT #0 `pre-send t+` dropped 18.62s -> 0.13-0.40s, qsize -> 0.
+  Remaining ~3s = Twilio "one moment please" + stream setup (irreducible). Full convict in the Jun 5
+  update below + memory `leo-answer-latency-in-transport`.
+- ✅ Gradio browser-test fix (`run_gradio_application.py` `set_voice` config drift). Branches cleaned
+  up - `main` is now the only branch (local + `backup`).
 
-**🎯 ANSWER-LATENCY: CONVICTED Jun 5 2026 — it is NOT ngrok/Twilio. It is fastrtc emit-queue
-starvation, in-process. The 3-session "transport/ngrok" theory is DISPROVEN.** Evidence + root
-cause + proposed fix in the Jun 5 update below and memory `leo-answer-latency-in-transport`.
-- `send_json` returns in 0.001-0.011s in BOTH a fast and a 18s-wait call -> ngrok + Twilio cleared.
-- On the slow call the greeting sits at the queue HEAD from +0.1s but `_emit_loop` isn't scheduled
-  to pull it for 18.6s (qsize balloons to 164,529). Producer `_emit_to_queue` spins on `emit()`
-  returning `None` (post-greeting idle), unbounded queue + no backpressure -> starves the consumer.
-- **FIX VALIDATED Jun 5 2026 — 5/5 calls instant.** Producer throttle (on `emit()==None`:
-  `await asyncio.sleep(0.02); continue` instead of `put_nowait(None)`) in `_emit_to_queue`. EMIT #0
-  `pre-send t+` dropped 18.62s -> 0.13-0.40s, qsize 164,529 -> 0 on every call. Remaining ~3s =
-  Twilio "one moment please" + stream setup (irreducible baseline).
-- **NEXT (cleanup/ship):** keep the fix, strip the `_emit_loop` timing logs (or gate them), rename
-  `observability/emit_instrument.py` to reflect it's a patch not instrumentation; report upstream to
-  fastrtc 0.0.33; then branch + commit (currently uncommitted, includes the gradio voice fix too).
-- Side bug still open: `time_limit` REST update in `handle_incoming_call` 400s every call ("not in-progress").
+**🎯 START HERE NEXT SESSION - pick one (all genuinely open, none blocked):**
+1. **Report the fastrtc emit-queue starvation bug upstream** (fastrtc 0.0.33). Real library concurrency
+   bug; clean OSS contribution + portfolio story. The fix + root cause are already written in
+   `observability/emit_instrument.py` - reuse that text for the issue/PR.
+2. **Fix the `time_limit` 400 side bug.** `handle_incoming_call` fires the Twilio `time_limit` REST
+   update before the call is in-progress, so it 400s ("Call is not in-progress") on every call. Off
+   the latency path but dead as written - move it later / retry once the call is live.
+3. **Per-turn latency** (the other dead air, mid-conversation): TTS variance 1.7-12s is the main one;
+   property search regressed to 5-14s (was ~4s); occasional ~6.8s LLM spike (try `reasoning_effort="low"`).
+4. **Parked: voice-replay eval harness** - batch-test STT->LLM->TTS without placing calls. Now MORE
+   attractive since the answer-latency bug (which it couldn't reproduce) is solved. See Jun 2 update.
+
+**To get running again:** `DOCKER_API_VERSION=1.41 docker compose up -d` (NOT `--build`, it hangs),
+wait for `/health`, then POST `/superlinked/ingest`. For phone calls: `make start-ngrok-tunnel` +
+point Twilio webhook at the tunnel. Browser latency test: `make start-gradio-application`
+(whisper-groq + together + Leo). The emit-queue fix loads automatically via `api/main.py`.
 
 Everything below this line is the older (pre-Jun-5) plan, kept for context.
 
