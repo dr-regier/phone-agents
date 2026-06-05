@@ -7,20 +7,65 @@
 
 ---
 
-## ▶ START HERE NEXT SESSION (last worked: Jun 1 2026)
+## ▶ START HERE NEXT SESSION (last worked: Jun 5 2026)
 
 **Done & shipped (on `main`, pushed to `backup`):**
 - ✅ Repetition bug fixed + validated in-call (commit `b94dbcf`). See Jun 1 update below.
 
-**Open, in priority order:**
-1. **Call-answer latency (18-35s) - biggest user-facing issue.** Diagnosed to the
-   FastRTC→Twilio transport (our greeting emits in ~0.1s; the dead air is downstream,
-   startup-only). NOT fixable in Leo's code. **Next step:** pick one - (A) instrument
-   fastrtc `_emit_loop` (queue depth + per-chunk send timestamps), or (B) browser A/B
-   via FastRTC's WebRTC test UI (bypasses Twilio + ngrok) to convict/exonerate ngrok.
-   Full context: Jun 1 update below + memory `leo-answer-latency-in-transport`.
-2. **Per-turn latency:** TTS variance (1.7-12s) is the main per-turn dead air; property
-   search regressed to 5-14s (was ~4s); occasional ~6.8s LLM spike (try `reasoning_effort="low"`).
+**🎯 ANSWER-LATENCY: CONVICTED Jun 5 2026 — it is NOT ngrok/Twilio. It is fastrtc emit-queue
+starvation, in-process. The 3-session "transport/ngrok" theory is DISPROVEN.** Evidence + root
+cause + proposed fix in the Jun 5 update below and memory `leo-answer-latency-in-transport`.
+- `send_json` returns in 0.001-0.011s in BOTH a fast and a 18s-wait call -> ngrok + Twilio cleared.
+- On the slow call the greeting sits at the queue HEAD from +0.1s but `_emit_loop` isn't scheduled
+  to pull it for 18.6s (qsize balloons to 164,529). Producer `_emit_to_queue` spins on `emit()`
+  returning `None` (post-greeting idle), unbounded queue + no backpressure -> starves the consumer.
+- **FIX VALIDATED Jun 5 2026 — 5/5 calls instant.** Producer throttle (on `emit()==None`:
+  `await asyncio.sleep(0.02); continue` instead of `put_nowait(None)`) in `_emit_to_queue`. EMIT #0
+  `pre-send t+` dropped 18.62s -> 0.13-0.40s, qsize 164,529 -> 0 on every call. Remaining ~3s =
+  Twilio "one moment please" + stream setup (irreducible baseline).
+- **NEXT (cleanup/ship):** keep the fix, strip the `_emit_loop` timing logs (or gate them), rename
+  `observability/emit_instrument.py` to reflect it's a patch not instrumentation; report upstream to
+  fastrtc 0.0.33; then branch + commit (currently uncommitted, includes the gradio voice fix too).
+- Side bug still open: `time_limit` REST update in `handle_incoming_call` 400s every call ("not in-progress").
+
+Everything below this line is the older (pre-Jun-5) plan, kept for context.
+
+---
+
+**🎯 TOP PRIORITY: chase call-answer latency (18-35s) via cheap bisection.**
+This is the biggest user-facing issue. The discipline: *localize the seconds to one hop
+before instrumenting or tuning anything.* Run the diagnostics cheapest-decisive first -
+do NOT jump to instrumenting code. Full reasoning in the Jun 2 update below.
+
+Run in this order, each one eliminates a hop:
+1. **Browser A/B test (do this FIRST - most decisive single cut).** FastRTC's built-in
+   WebRTC UI bypasses BOTH ngrok and Twilio. Greet Leo in-browser vs on the phone:
+   - Instant in browser → problem is ngrok or Twilio, NOT our app. Stop reading our code.
+   - Also laggy in browser → problem is FastRTC emit / our side. Then step 4 is worth it.
+   Next action when we resume: check the FastRTC browser UI is reachable + how Leo launches.
+2. **ngrok inspector (`http://127.0.0.1:4040`) - free, zero code, already running.**
+   Shows per-connection tunnel timing incl. the media-stream WebSocket. Data we've never read.
+3. **Twilio Console call logs - free, server-side timestamps** of stream events
+   (connected/start/media) = the far end of the pipe's view of when audio actually arrived.
+4. **Instrument fastrtc `_emit_loop`** (queue depth + per-chunk send timestamps) - ONLY if
+   steps 1-3 point back inward at our app.
+
+Why this order: steps 1-3 are ~zero effort and each eliminates a hop. We don't write a line
+of instrumentation until the free data says which hop to instrument.
+
+Leading hypothesis (NOT yet proven): the 2x call-to-call variance (18 vs 35s) + startup-only
+pattern points at infra (ngrok free-tier throttling the high-freq media WS), not a fixed code
+path. Treat as suspect, not verdict. Context: memory `leo-answer-latency-in-transport`.
+
+**Then (lower priority): per-turn latency** - TTS variance (1.7-12s) is the main per-turn dead
+air; property search regressed to 5-14s (was ~4s); occasional ~6.8s LLM spike (try
+`reasoning_effort="low"`).
+
+**Parked idea (raised Jun 2, not started):** build an eval harness to replay voice turns
+WITHOUT placing phone calls (tap STT→LLM→TTS below the transport) so we can batch-test changes
+instead of manually calling 5x per change. Note: this helps per-turn/repetition testing but
+canNOT reproduce the answer-latency bug - that one only lives in the real transport (the browser
+A/B is its substitute). Revisit after answer-latency is localized.
 
 **To get running again:** `DOCKER_API_VERSION=1.41 docker compose up -d` (NOT `--build`,
 it hangs - existing image is fine), wait for `/health`, then POST `/superlinked/ingest`.
@@ -93,6 +138,46 @@ UI (bypasses Twilio + ngrok) to convict/exonerate ngrok.
 - Source is bind-mounted (`./src/realtime_phone_agents:/app/...`), so code edits need only
   `docker compose restart phone-calling-agent-api` - no rebuild. `--build` was hanging (compose
   deadlock in `futex_`); the existing image already has all committed code.
+
+---
+
+## UPDATE - Jun 2 2026 session (planning, no code changes)
+
+Mostly a thinking/planning session. Sharpened the answer-latency attack into a concrete
+bisection plan and parked an eval-harness idea. No calls placed, nothing shipped.
+
+### Decision: answer-latency is the top priority, chased by cheap bisection
+The whole span between our `yield` and the caller's ear is unmeasured. We've only proven
+the greeting is **yielded** at 0.1s; the 18-35s hides across three un-instrumented hops:
+
+```
+yield (our code) ──► FastRTC _emit_loop sends on WS ──► ngrok tunnel ──► Twilio buffers + plays ──► ear
+  0.1s ✓ measured        ✗ unmeasured              ✗ unmeasured       ✗ unmeasured
+```
+
+The job is to **bisect that span** until the seconds are cornered in one hop. Two signals
+drive the hypothesis: (1) **startup-only** = it's connection-setup, not bandwidth/codec;
+(2) **2x call-to-call variance (18 vs 35s)** = smells like infra/queue contention, not a
+fixed code path → ngrok free-tier is the leading suspect, but that's a hypothesis to test,
+not a verdict. The ranked diagnostic plan (browser A/B → ngrok inspector → Twilio logs →
+instrument `_emit_loop` only if needed) is now written in the START HERE block at the top.
+
+### Parked: voice-replay eval harness
+Ryan raised the real pain - manually placing 5 calls per change to verify is slow. Idea:
+replay turns below the transport (drive STT→LLM→TTS directly) to batch-test without phoning.
+Was about to map the agent's seams (`fastrtc_agent.py`, the react agent, STT/TTS interfaces,
+existing tests) when we pivoted to answer-latency. Key caveat captured: this harness helps
+per-turn + repetition testing but **cannot reproduce the answer-latency bug** (that lives only
+in the real transport; the browser A/B is its stand-in). Revisit after answer-latency is localized.
+
+### Methodology notes worth keeping (AI-engineer muscle, for Five9 Cortex/FDE)
+- **Localize before you tune.** Attribute every problem to a pipeline stage (STT/LLM/TTS/
+  transport) before touching a knob. Half our findings were NOT prompt problems.
+- **A stage you didn't timestamp is a stage you'll wrongly blame.** Instrument boundaries, diff them.
+- **Median vs tail.** A spread (TTS 1.7-12s) IS the finding; tails mean queueing/retries/cold paths.
+- **Flag + trigger.** A flagged anomaly is noise until grouped by what input produced it.
+- **One variable at a time.** The repetition fix changed 3 knobs at once - `frequency_penalty`
+  is the *suspected* primary lever, NOT verified in isolation. Don't over-claim cause.
 
 ---
 

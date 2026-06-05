@@ -40,6 +40,12 @@ app.include_router(health.router)
 app.include_router(superlinked.router)
 app.include_router(voice.router)
 
+# Patch a fastrtc 0.0.33 emit-queue starvation bug that caused up to ~18s of dead air
+# before the greeting on inbound calls. See observability/emit_instrument.py.
+from realtime_phone_agents.observability import emit_instrument
+
+emit_instrument.install()
+
 # Mount voice stream for Twilio integration
 mount_voice_stream(app)
 

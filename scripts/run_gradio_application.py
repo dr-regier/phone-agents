@@ -164,12 +164,16 @@ def main():
     print_info(f"Initializing {tts_model} TTS model...")
     try:
         tts_model_instance = get_tts_model(tts_model)
-        
-        # Set voice for Together AI or Orpheus RunPod models
-        if tts_model in ["together", "orpheus-runpod"]:
+
+        # Only Orpheus uses avatar-name voices (leo/tara/dan/...). Together now
+        # points at cartesia/sonic-3, whose voices are NOT avatar names, so
+        # set_voice(avatar) would send an invalid voice and 400. Leave Together
+        # at its .env default ("customer support man") — the same voice the phone
+        # path uses — so this browser test mirrors the phone exactly.
+        if tts_model == "orpheus-runpod":
             print_info(f"Setting voice to {avatar} for {tts_model} model...")
             tts_model_instance.set_voice(avatar)
-        
+
         print_success("TTS model initialized")
     except Exception as e:
         print_error(f"Error initializing TTS model: {e}")
