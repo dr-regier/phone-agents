@@ -7,32 +7,62 @@
 
 ---
 
-## ▶ START HERE NEXT SESSION (last worked: Jun 5 2026)
+## ▶ START HERE NEXT SESSION (last worked: Jun 6 2026)
 
-**Done & shipped (on `main`, pushed to `backup`):**
-- ✅ Repetition bug fixed + validated in-call (commit `b94dbcf`). See Jun 1 update below.
-- ✅ **Answer-latency (18-35s dead air) FIXED + validated 5/5 calls (commit `24c425c`).** It was NOT
-  ngrok/Twilio (3-session theory DISPROVEN) - it was fastrtc emit-queue starvation. Producer
-  `_emit_to_queue` spun on `emit()==None`, flooding an unbounded queue (164k items) and starving the
-  consumer from sending the greeting (sat at queue head from +0.1s but not pulled for 18.6s). Fix:
-  20ms idle backoff + skip the None enqueue, as a monkeypatch in `observability/emit_instrument.py`
-  installed from `api/main.py`. EMIT #0 `pre-send t+` dropped 18.62s -> 0.13-0.40s, qsize -> 0.
-  Remaining ~3s = Twilio "one moment please" + stream setup (irreducible). Full convict in the Jun 5
-  update below + memory `leo-answer-latency-in-transport`.
-- ✅ Gradio browser-test fix (`run_gradio_application.py` `set_voice` config drift). Branches cleaned
-  up - `main` is now the only branch (local + `backup`).
+**🎯 NEXT TASK: kill the repetition / over-talking degeneration (reproduced Jun 6, NOT actually fixed).**
+The Jun 1 "fix" was insufficient. On a Jun 6 test call, **turn 2 degenerated again** - the model
+stacked ~7 questions and role-played both sides in one reply ("How many bedrooms do you need?...And
+how many baths would be ideal?Any particular neighborhoods you love...Are you buying for a family..."),
+which also caused the dead air (156/190-char TTS chunks took 8.5s each).
 
-**🎯 START HERE NEXT SESSION - pick one (all genuinely open, none blocked):**
-1. **Report the fastrtc emit-queue starvation bug upstream** (fastrtc 0.0.33). Real library concurrency
-   bug; clean OSS contribution + portfolio story. The fix + root cause are already written in
-   `observability/emit_instrument.py` - reuse that text for the issue/PR.
-2. **Fix the `time_limit` 400 side bug.** `handle_incoming_call` fires the Twilio `time_limit` REST
-   update before the call is in-progress, so it 400s ("Call is not in-progress") on every call. Off
-   the latency path but dead as written - move it later / retry once the call is live.
-3. **Per-turn latency** (the other dead air, mid-conversation): TTS variance 1.7-12s is the main one;
-   property search regressed to 5-14s (was ~4s); occasional ~6.8s LLM spike (try `reasoning_effort="low"`).
-4. **Parked: voice-replay eval harness** - batch-test STT->LLM->TTS without placing calls. Now MORE
-   attractive since the answer-latency bug (which it couldn't reproduce) is solved. See Jun 2 update.
+**Corrected diagnosis (important - supersedes the Jun 1 "prompt gap" idea):**
+- `avatars/definitions/leo.yaml` is **DEAD CODE** - YAML loading is commented out in `registry.py`/`base.py`.
+  The live prompt is `SYSTEM_PROMPT_TEMPLATE` in `avatars/base.py`. Don't edit the yaml.
+- That live prompt **ALREADY contains every anti-repetition rule**: "Ask one question at a time. Do not
+  stack questions." (`base.py:25`), "Do not repeat yourself" (`:26`), "one or two short sentences" (`:27`),
+  "Do not give long speeches or ask for budget, beds, and neighborhood all at once" (`:55`).
+- Turn 2 **violated all four explicit rules.** So this is NOT a prompt gap - the model (gpt-oss-120b) is
+  **disobeying clear instructions** on requirements-gathering turns. Adding more prompt text won't help.
+- The Jun 1 `frequency_penalty=0.6` (still present in `fastrtc_agent.py:156-160`, temp=0.5, max_tokens=512)
+  reduced but did NOT eliminate it.
+
+**Levers to pick from tomorrow (one variable at a time - the discipline we keep breaking here):**
+1. **Hard post-generation guard (most reliable, recommended):** truncate Leo's reply before TTS - cut at
+   the first `?` or after 2 sentences. Deterministic, model-agnostic, guarantees brevity. Tradeoff: must
+   special-case the property readout (price/neighborhood/beds/baths/sqft needs 2-3 sentences). Most
+   FDE-relevant ("enforce the contract, don't trust the model").
+2. **Generation knobs:** raise `frequency_penalty`, add `presence_penalty`, lower `max_tokens`. Cheap, but
+   0.6 already leaked - weak lever against a model ignoring instructions.
+3. **`reasoning_effort` / model swap:** gpt-oss-120b may just degenerate on this turn type. Bigger change,
+   cost variance.
+4. **Splitter hardening (`?...` joins in `_split_sentences`):** only stops the 8s mega-breath, does NOT
+   stop the over-asking. Mitigation, not a fix.
+
+Ryan leaning: decide tomorrow. #1 is the only guaranteed fix; #2 is the cheap experiment to try first.
+
+**Done & shipped this session (Jun 5-6, on `main`):**
+- ✅ **Removed the "one moment please" Twilio filler** (commit `bdb2d1c`). It masked the old answer-latency
+  dead air, now fixed - greeting lands in 0.13-0.40s. Validated on a live call, feels snappy.
+- ✅ **`time_limit` 400 bug FIXED + validated in-call** (commit `6007b96`). Was issued inline in the webhook
+  before the call was in-progress -> 400 every call. Now applied from a retrying background task
+  (`stream.py` `_set_time_limit_when_live`, 2s backoff, runs the blocking REST call in a thread, holds a
+  task ref). Logs showed `Set call time limit to 300s ... (attempt 1)` on both test calls - accepted first try.
+- ✅ **fastrtc upstream contribution kit written** (commit `1cafa50`, `docs/fastrtc-emit-queue-upstream.md`).
+  Issue-#203 comment + PR description + exact diff + checklist, ready to post. Bug confirmed STILL present
+  on fastrtc `main`/`0.0.34` (we're on `0.0.33`); `0.0.34` changelog unrelated. NOT yet submitted - do a
+  GitHub identity check first (commits go out as `dr-regier`). This was START-HERE option 1, now prepped.
+
+**Earlier shipped (pre-Jun-5, on `main` + `backup`):**
+- ✅ **Answer-latency (18-35s dead air) FIXED + validated 5/5 calls (commit `24c425c`).** fastrtc emit-queue
+  starvation (NOT ngrok/Twilio). Fix = 20ms idle backoff monkeypatch in `observability/emit_instrument.py`,
+  installed from `api/main.py`. See memory `leo-answer-latency-in-transport` + Jun 5 update below.
+- ✅ Gradio browser-test fix (`run_gradio_application.py` `set_voice` drift). `main` is the only branch.
+
+**Other open items (not blocked, lower priority than repetition):**
+- **Submit the fastrtc upstream issue/PR** (kit is ready; just needs the GitHub-identity check + posting).
+- **Per-turn latency:** TTS variance 1.7-12s; property search regressed to 5-14s (was ~4s); ~6.8s LLM spike.
+- **Parked: voice-replay eval harness** - batch-test STT->LLM->TTS without placing calls. Would make the
+  repetition work above much faster to iterate on (no 5x manual calls per change). See Jun 2 update.
 
 **To get running again:** `DOCKER_API_VERSION=1.41 docker compose up -d` (NOT `--build`, it hangs),
 wait for `/health`, then POST `/superlinked/ingest`. For phone calls: `make start-ngrok-tunnel` +
