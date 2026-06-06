@@ -1,3 +1,5 @@
+import asyncio
+
 from fastrtc import Stream
 from fastapi.responses import HTMLResponse
 from fastapi.requests import Request
@@ -15,6 +17,7 @@ class VoiceAgentStream(Stream):
     _caller_phone: str | None = None
     _call_sid: str | None = None
     _on_caller_phone: Callable[[str], None] | None = None
+    _background_tasks: set[asyncio.Task]
 
     def hang_up(self) -> None:
         """Terminate the active call via Twilio REST API."""
@@ -88,6 +91,51 @@ class VoiceAgentStream(Stream):
             ui_args=ui_args,
             verbose=verbose,
         )
+        # Holds references to fire-and-forget tasks so they aren't garbage collected
+        # mid-flight (a documented asyncio.create_task gotcha).
+        self._background_tasks = set()
+
+    def _spawn_background_task(self, coro) -> None:
+        """Run a coroutine fire-and-forget while keeping a strong reference to it."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _set_time_limit_when_live(self, call_sid: str) -> None:
+        """Apply Twilio's hard call ``time_limit`` once the call reaches in-progress.
+
+        The incoming-call webhook fires before the call is in-progress, so issuing the
+        ``time_limit`` update inline 400s with "Call is not in-progress". Twilio moves the
+        call to in-progress within ~1-2s of executing the TwiML, so we retry with a short
+        backoff until it accepts the update (or give up after a bounded budget). The blocking
+        REST call runs in a thread to keep it off the audio event loop.
+        """
+        from twilio.rest import Client
+        from realtime_phone_agents.config import settings
+
+        client = Client(settings.twilio.account_sid, settings.twilio.auth_token)
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
+            await asyncio.sleep(2.0)
+            try:
+                await asyncio.to_thread(
+                    client.calls(call_sid).update, time_limit=MAX_CALL_DURATION_SECONDS
+                )
+                logger.info(
+                    f"Set call time limit to {MAX_CALL_DURATION_SECONDS}s for {call_sid} "
+                    f"(attempt {attempt})"
+                )
+                return
+            except Exception as e:
+                if "not in-progress" in str(e).lower() and attempt < max_attempts:
+                    logger.debug(
+                        f"Call {call_sid} not in-progress yet (attempt {attempt}); retrying"
+                    )
+                    continue
+                logger.warning(
+                    f"Failed to set time limit for {call_sid} after {attempt} attempt(s): {e}"
+                )
+                return
 
     async def handle_incoming_call(self, request: Request):
         """
@@ -104,7 +152,6 @@ class VoiceAgentStream(Stream):
         """
         from twilio.twiml.voice_response import Connect, VoiceResponse
 
-        from twilio.rest import Client
         from realtime_phone_agents.config import settings
 
         form = await request.form()
@@ -115,14 +162,11 @@ class VoiceAgentStream(Stream):
         if self._caller_phone and self._on_caller_phone:
             self._on_caller_phone(self._caller_phone)
 
-        # Set hard time limit on the call via Twilio REST API
+        # Enforce a hard Twilio-level call duration cap. The call isn't in-progress yet at
+        # webhook time (an inline update 400s "Call is not in-progress"), so apply it from a
+        # background task that retries once the call goes live.
         if self._call_sid and settings.twilio.account_sid and settings.twilio.auth_token:
-            try:
-                client = Client(settings.twilio.account_sid, settings.twilio.auth_token)
-                client.calls(self._call_sid).update(time_limit=MAX_CALL_DURATION_SECONDS)
-                logger.info(f"Set call time limit to {MAX_CALL_DURATION_SECONDS}s")
-            except Exception as e:
-                logger.warning(f"Failed to set call time limit: {e}")
+            self._spawn_background_task(self._set_time_limit_when_live(self._call_sid))
 
         response = VoiceResponse()
         connect = Connect()
