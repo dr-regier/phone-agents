@@ -59,7 +59,10 @@ Ryan leaning: decide tomorrow. #1 is the only guaranteed fix; #2 is the cheap ex
 - ✅ Gradio browser-test fix (`run_gradio_application.py` `set_voice` drift). `main` is the only branch.
 
 **Other open items (not blocked, lower priority than repetition):**
-- **Submit the fastrtc upstream issue/PR** (kit is ready; just needs the GitHub-identity check + posting).
+- ✅ **fastrtc upstream contribution SUBMITTED Jun 8 2026** (Ryan's first OSS contribution). PR
+  https://github.com/gradio-app/fastrtc/pull/430 + analysis comment on issue #203
+  (https://github.com/gradio-app/fastrtc/issues/203#issuecomment-4652142822), both under `dr-regier`.
+  Fork at `/home/rregier/projects/fastrtc`. Maintainer response pending (no SLA - fine if it sits).
 - **Per-turn latency:** TTS variance 1.7-12s; property search regressed to 5-14s (was ~4s); ~6.8s LLM spike.
 - **Parked: voice-replay eval harness** - batch-test STT->LLM->TTS without placing calls. Would make the
   repetition work above much faster to iterate on (no 5x manual calls per change). See Jun 2 update.
