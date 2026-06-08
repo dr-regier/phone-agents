@@ -145,14 +145,20 @@ class FastRTCAgent:
         llm = ChatGroq(
             model=settings.groq.model,
             api_key=settings.groq.api_key,
-            # Anti-repetition: traces showed the model degenerating into multi-turn
-            # restatements on scheduling/confirmation turns (it role-played both sides
-            # of the conversation in one reply). frequency_penalty is the primary lever
-            # (directly penalizes repeated tokens) and lower temperature reduces the
-            # odds of degenerating into a loop. max_tokens is only a runaway backstop:
-            # gpt-oss is a reasoning model whose reasoning tokens count toward this cap,
-            # so it is set high enough to never truncate a real answer (a full property
-            # readout ~130 tokens + reasoning ~150) while still stopping infinite output.
+            # reasoning_format="hidden" is the real fix for the "repetition" /
+            # "Leo spoke his thoughts" bug. gpt-oss is a harmony-format reasoning
+            # model with separate analysis + final channels; with reasoning_format
+            # unset, Groq concatenates the analysis channel INTO content, so
+            # _extract_final_text (which reads msg.content) fed Leo's scratchpad to
+            # TTS ("We need to respond with something? ... The guidelines: try a
+            # different angle." / "(Waiting for your reply…)"). "hidden" strips the
+            # analysis channel so only the final answer is spoken. This supersedes
+            # the earlier frequency_penalty/temperature anti-repetition attempt —
+            # those can't fix a channel-separation leak.
+            reasoning_format="hidden",
+            # max_tokens is a runaway backstop only: gpt-oss reasoning tokens count
+            # toward this cap, so it is set high enough to never truncate a real
+            # answer while still stopping infinite output.
             temperature=0.5,
             max_tokens=512,
             model_kwargs={
@@ -350,7 +356,7 @@ class FastRTCAgent:
                         # conversation flows naturally before the search.
                         model_text = self._extract_final_text(data)
                         if model_text and model_text.strip():
-                            message = model_text.strip()
+                            message = self._clip_at_first_question(model_text.strip())
                         elif is_sms:
                             message = "Sending that over to you now."
                         else:
@@ -402,7 +408,33 @@ class FastRTCAgent:
         Returns:
             Final response text
         """
-        return getattr(self, "_last_final_text", None) or self._fallback_message
+        final = getattr(self, "_last_final_text", None) or self._fallback_message
+        return self._clip_at_first_question(final)
+
+    @staticmethod
+    def _clip_at_first_question(text: str) -> str:
+        """Enforce one-question-at-a-time by truncating at the first question mark.
+
+        Even with reasoning_format="hidden" (which fixed the analysis-channel
+        leak), gpt-oss still degenerates on scheduling/confirmation turns by
+        role-playing both sides of several future turns in one reply (e.g.
+        "Which day works?Perfect, let's lock it in.Shall I text you?..."). That
+        collapses the turn-by-turn exchange the scheduling flow needs and,
+        critically, makes Leo narrate sending the SMS without ever reaching the
+        real send_sms tool turn.
+
+        Cutting at the first "?" keeps the lead-in plus the single question and
+        drops the invented continuation. Property readouts are unaffected —
+        their only question sits at the end ("...Want more details or a
+        showing?"). Replies with no question (confirmations, "the text is on its
+        way") are returned unchanged.
+        """
+        if not text:
+            return text
+        idx = text.find("?")
+        if idx == -1:
+            return text
+        return text[: idx + 1].strip()
 
     @staticmethod
     def _split_sentences(text: str) -> list[str]:
