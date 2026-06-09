@@ -156,6 +156,13 @@ class FastRTCAgent:
             # the earlier frequency_penalty/temperature anti-repetition attempt —
             # those can't fix a channel-separation leak.
             reasoning_format="hidden",
+            # NOTE: reasoning_effort="low" was tried Jun 9 and REVERTED — it did NOT
+            # reduce the LLM latency spikes (worst ChatGroq turn got WORSE: 13s → 23s)
+            # and degraded quality (SMS misfired, Leo faltered late in calls). The 20s+
+            # spikes appear on the LAST turns of longer calls, which points more at
+            # Groq-side queueing/rate-limiting than at reasoning token volume — needs the
+            # Groq x-groq queue_time vs completion_time metadata to confirm before the
+            # next attempt. See [[leo-latency-and-repetition-findings]].
             # max_tokens is a runaway backstop only: gpt-oss reasoning tokens count
             # toward this cap, so it is set high enough to never truncate a real
             # answer while still stopping infinite output.
@@ -342,6 +349,11 @@ class FastRTCAgent:
             stream_mode="updates",
         ):
             for step, data in chunk.items():
+                # Log Groq server-side timing for every LLM call (a tool turn
+                # makes two, so this fires per-call, not per-turn).
+                if step == "model":
+                    self._log_groq_timing(data)
+
                 # Handle tool calls — only speak on the first tool call in
                 # this turn so the caller doesn't hear repeated messages
                 # when the LLM chains multiple searches.
@@ -400,6 +412,37 @@ class FastRTCAgent:
         if isinstance(msgs, list) and len(msgs) > 0:
             return getattr(msgs[0], "content", None)
         return None
+
+    @staticmethod
+    def _log_groq_timing(model_step_data) -> None:
+        """Log Groq's per-call server-side timing to split the LLM latency spike.
+
+        Jun 9: the 20-28s ChatGroq spikes (worst on the LAST turns of long calls)
+        could be Groq-side queueing (rate limit), prompt processing (context growth),
+        or real generation. Groq returns all three in response_metadata.token_usage
+        (queue_time / prompt_time / completion_time), plus reasoning_tokens. Logging
+        them per call lets the data pick the lever instead of guessing.
+        """
+        msgs = model_step_data.get("messages", [])
+        if not (isinstance(msgs, list) and msgs):
+            return
+        meta = getattr(msgs[0], "response_metadata", None) or {}
+        tu = meta.get("token_usage") or {}
+        if not tu:
+            logger.info("GROQ_TIMING: no token_usage in response_metadata "
+                        f"(keys={list(meta.keys())})")
+            return
+        details = tu.get("completion_tokens_details") or {}
+        logger.info(
+            "GROQ_TIMING "
+            f"queue={tu.get('queue_time', 0):.3f}s "
+            f"prompt={tu.get('prompt_time', 0):.3f}s "
+            f"completion={tu.get('completion_time', 0):.3f}s "
+            f"total={tu.get('total_time', 0):.3f}s | "
+            f"prompt_tok={tu.get('prompt_tokens', 0)} "
+            f"completion_tok={tu.get('completion_tokens', 0)} "
+            f"reasoning_tok={details.get('reasoning_tokens', 0)}"
+        )
 
     async def _get_final_response(self) -> str:
         """

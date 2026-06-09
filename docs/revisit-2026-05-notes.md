@@ -7,40 +7,64 @@
 
 ---
 
-## ▶ START HERE NEXT SESSION (last worked: Jun 6 2026)
+## ▶ START HERE NEXT SESSION (last worked: Jun 9 2026)
 
-**🎯 NEXT TASK: kill the repetition / over-talking degeneration (reproduced Jun 6, NOT actually fixed).**
-The Jun 1 "fix" was insufficient. On a Jun 6 test call, **turn 2 degenerated again** - the model
-stacked ~7 questions and role-played both sides in one reply ("How many bedrooms do you need?...And
-how many baths would be ideal?Any particular neighborhoods you love...Are you buying for a family..."),
-which also caused the dead air (156/190-char TTS chunks took 8.5s each).
+**🎯 NEXT TASK: capture a `GROQ_TIMING` log line from a real LLM-latency SPIKE turn. That single
+data point settles a question that's been open for weeks. Do NOT change any code first.**
 
-**Corrected diagnosis (important - supersedes the Jun 1 "prompt gap" idea):**
-- `avatars/definitions/leo.yaml` is **DEAD CODE** - YAML loading is commented out in `registry.py`/`base.py`.
-  The live prompt is `SYSTEM_PROMPT_TEMPLATE` in `avatars/base.py`. Don't edit the yaml.
-- That live prompt **ALREADY contains every anti-repetition rule**: "Ask one question at a time. Do not
-  stack questions." (`base.py:25`), "Do not repeat yourself" (`:26`), "one or two short sentences" (`:27`),
-  "Do not give long speeches or ask for budget, beds, and neighborhood all at once" (`:55`).
-- Turn 2 **violated all four explicit rules.** So this is NOT a prompt gap - the model (gpt-oss-120b) is
-  **disobeying clear instructions** on requirements-gathering turns. Adding more prompt text won't help.
-- The Jun 1 `frequency_penalty=0.6` (still present in `fastrtc_agent.py:156-160`, temp=0.5, max_tokens=512)
-  reduced but did NOT eliminate it.
+Why this is the task: the per-turn latency spikes (`ChatGroq` spans of 9-28s, seen across May 29 /
+Jun 1 / Jun 6 / Jun 9 traces) are still **unexplained**. Jun 9 narrowed it but did not solve it.
 
-**Levers to pick from tomorrow (one variable at a time - the discipline we keep breaking here):**
-1. **Hard post-generation guard (most reliable, recommended):** truncate Leo's reply before TTS - cut at
-   the first `?` or after 2 sentences. Deterministic, model-agnostic, guarantees brevity. Tradeoff: must
-   special-case the property readout (price/neighborhood/beds/baths/sqft needs 2-3 sentences). Most
-   FDE-relevant ("enforce the contract, don't trust the model").
-2. **Generation knobs:** raise `frequency_penalty`, add `presence_penalty`, lower `max_tokens`. Cheap, but
-   0.6 already leaked - weak lever against a model ignoring instructions.
-3. **`reasoning_effort` / model swap:** gpt-oss-120b may just degenerate on this turn type. Bigger change,
-   cost variance.
-4. **Splitter hardening (`?...` joins in `_split_sentences`):** only stops the 8s mega-breath, does NOT
-   stop the over-asking. Mitigation, not a fix.
+**What Jun 9 PROVED (don't re-litigate):**
+- Added `_log_groq_timing` in `fastrtc_agent.py` (logs Groq's `token_usage`: queue / prompt /
+  completion / total time + reasoning_tokens, per LLM call). Fires on every model step. It's wired
+  and live - nothing to add.
+- On a clean call, **every LLM call returned in total_time 0.17-1.24s** (queue <0.18s, prompt <0.7s,
+  completion <0.9s). So LLM token *generation* is fast. A 20s `ChatGroq` SPAN is therefore wall-clock
+  time spent on something OTHER than generating tokens.
 
-Ryan leaning: decide tomorrow. #1 is the only guaranteed fix; #2 is the cheap experiment to try first.
+**What is still OPEN (do not claim resolved):**
+- We have **zero `GROQ_TIMING` lines from an actual spike turn** - the clean call didn't spike, and
+  the later calls hard-failed (see cap below) before generating. So the spike mechanism is unproven.
+- Candidates, none confirmed: (a) per-MINUTE rate-limit (TPM/RPM) retry-backoff inside `langchain_groq`
+  - fits the cross-day pattern; (b) **event-loop starvation** inflating the awaited span - this
+  codebase HAD an emit-queue starvation bug (see `docs/fastrtc-emit-queue-upstream.md`); (c) network stalls.
+- ⚠️ Earlier today this doc/memory briefly claimed the spikes were "rate-limit retries / daily-cap
+  depletion." That was an OVERREACH (the daily cap resets daily, can't explain low-volume-day spikes).
+  Ryan caught it. Stay honest: generation-is-fast is proven; the spike cause is not.
 
-**Done & shipped this session (Jun 5-6, on `main`):**
+**The decisive test (run tomorrow once Groq tokens reset):** make one longer call, let a turn spike
+to ~15-20s, then read that turn's `GROQ_TIMING` line:
+`docker logs phone-calling-agent-api 2>&1 | grep GROQ_TIMING`
+- spike span with **total_time ≈ 0.5s** → the time is NOT in Groq → it's retry-backoff or loop-stall
+  → next look: `langchain_groq` retry/max_retries config + the async emit loop.
+- spike span with **completion_time ≈ 20s** → it really is generation → revisit generation/model.
+
+**⚠️ Groq FREE-TIER daily cap (hit Jun 9 ~21:14):** `openai/gpt-oss-120b` on-demand free tier =
+**200,000 tokens/day**. ~13 test calls exhausted it → hard 429s killed calls entirely. Token burn is
+high: every turn re-sends FULL conversation history (prompt_tok grew 1480→3350 within one call) on a
+reasoning model. If testing is blocked tomorrow, either wait for reset or upgrade to Groq Dev tier.
+Trimming per-turn history is a separate lever worth considering regardless.
+
+**Other confirmed latency facts (Jun 9 span breakdown, `/tmp/span_breakdown.py`):**
+- **TTS (Cartesia) is the only consistent latency floor:** ~5s mean on EVERY turn, spiking to
+  9.5-11.3s on long readouts. Non-streaming. This is the real, always-present lever once the spike
+  question is closed - candidate: switch Cartesia to streaming.
+- `search_property_tool` is ~1.2-2.5s, NOT a bottleneck (the old "search regressed to 5-14s" claim
+  was wrong - that time was the LLM, not search). STT ~1s, fine.
+- **`reasoning_effort="low"` was TRIED + REVERTED Jun 9.** Degraded quality in 3 live calls (SMS
+  misfired, Leo faltered late). Its latency rationale is moot until the spike mechanism is known.
+  Only a NOTE comment remains in `fastrtc_agent.py` (~line 159).
+
+**Done & shipped (Jun 8):**
+- ✅ **Repetition / "Leo spoke his thoughts" bug FIXED + validated** (commit `779718c`). Root cause was
+  NOT the model disobeying the prompt (the Jun 6 diagnosis below was wrong). It was TWO bugs: (1) a
+  reasoning-channel leak - `reasoning_format` was unset so Groq concatenated gpt-oss's analysis channel
+  into `content`, which got spoken; fixed with `reasoning_format="hidden"`. (2) final-channel over-talk
+  on scheduling turns - fixed with `_clip_at_first_question` (truncate spoken text at first `?`), which
+  also fixed `send_sms` never firing. Validated on 2 live calls.
+
+**Done & shipped (Jun 5-6, on `main`):**
 - ✅ **Removed the "one moment please" Twilio filler** (commit `bdb2d1c`). It masked the old answer-latency
   dead air, now fixed - greeting lands in 0.13-0.40s. Validated on a live call, feels snappy.
 - ✅ **`time_limit` 400 bug FIXED + validated in-call** (commit `6007b96`). Was issued inline in the webhook
@@ -63,7 +87,9 @@ Ryan leaning: decide tomorrow. #1 is the only guaranteed fix; #2 is the cheap ex
   https://github.com/gradio-app/fastrtc/pull/430 + analysis comment on issue #203
   (https://github.com/gradio-app/fastrtc/issues/203#issuecomment-4652142822), both under `dr-regier`.
   Fork at `/home/rregier/projects/fastrtc`. Maintainer response pending (no SLA - fine if it sits).
-- **Per-turn latency:** TTS variance 1.7-12s; property search regressed to 5-14s (was ~4s); ~6.8s LLM spike.
+- **Per-turn latency:** see the START HERE block above for the corrected Jun 9 picture (TTS ~5s floor
+  is the real lever; the "search regressed to 5-14s" claim here was WRONG - that was LLM time; spike
+  mechanism still open). This older line is superseded.
 - **Parked: voice-replay eval harness** - batch-test STT->LLM->TTS without placing calls. Would make the
   repetition work above much faster to iterate on (no 5x manual calls per change). See Jun 2 update.
 
