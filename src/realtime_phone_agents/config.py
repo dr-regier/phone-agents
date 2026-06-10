@@ -126,6 +126,18 @@ class Settings(BaseSettings):
     opik: OpikSettings = Field(default_factory=OpikSettings)
     twilio: TwilioSettings = Field(default_factory=TwilioSettings)
 
+    # Provider for the conversational LLM. "together" routes the agent to
+    # Together AI's OpenAI-compatible endpoint (reuses together.api_key /
+    # together.api_url); "groq" keeps the original ChatGroq path as fallback.
+    llm_provider: str = Field(
+        default="groq",
+        description="Conversational LLM provider: together | groq",
+    )
+    together_llm_model: str = Field(
+        default="openai/gpt-oss-120b",
+        description="Together AI model id for the conversational LLM",
+    )
+
     stt_model: str = Field(
         default="whisper-groq",
         description="STT model to use (moonshine, whisper-groq, faster-whisper)",

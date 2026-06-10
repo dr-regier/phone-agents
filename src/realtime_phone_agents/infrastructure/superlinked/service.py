@@ -1,3 +1,4 @@
+import time
 from typing import Any
 
 import pandas as pd
@@ -111,11 +112,20 @@ class PropertySearchService:
 
     async def search_properties(self, query: str, limit: int = 1):
         """Search for properties using semantic search and natural queries"""
+        # SEARCH_TIMING: async_query includes Superlinked's natural-query LLM parse
+        # (OpenAI, see query.py with_natural_query) + the Qdrant vector search. A
+        # large value here points at the parser model, not the vector DB.
+        _start = time.monotonic()
         try:
             results = await self.app.async_query(
                 property_search_query, natural_query=query, limit=limit
             )
+            elapsed = time.monotonic() - _start
             properties = self._result_to_properties(results)
+            logger.info(
+                f"SEARCH_TIMING async_query={elapsed:.3f}s "
+                f"results={len(properties)} query={query!r}"
+            )
 
             if not properties:
                 logger.warning(f"Properties for query '{query}' not found")
@@ -123,7 +133,9 @@ class PropertySearchService:
 
             return properties
         except Exception as e:
-            logger.error(f"Error searching properties: {e}")
+            logger.error(
+                f"Error searching properties after {time.monotonic() - _start:.3f}s: {e}"
+            )
             return []
 
 

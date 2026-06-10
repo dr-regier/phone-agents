@@ -7,44 +7,55 @@
 
 ---
 
-## ▶ START HERE NEXT SESSION (last worked: Jun 9 2026)
+## ▶ START HERE NEXT SESSION (last worked: Jun 10 2026 evening)
 
-**🎯 NEXT TASK: capture a `GROQ_TIMING` log line from a real LLM-latency SPIKE turn. That single
-data point settles a question that's been open for weeks. Do NOT change any code first.**
+**🎯 NEXT TASK: try `langchain-together` (ChatTogether) for the conversational LLM.** The latency
+mystery is SOLVED (see below); the only open problem is getting clean Together output. ChatTogether is
+the one shot at a fully-clean win (fast + correct + escapes the Groq cap).
 
-Why this is the task: the per-turn latency spikes (`ChatGroq` spans of 9-28s, seen across May 29 /
-Jun 1 / Jun 6 / Jun 9 traces) are still **unexplained**. Jun 9 narrowed it but did not solve it.
+**✅ LATENCY MYSTERY SOLVED Jun 10 PM — it was Groq rate-limit throttling.**
+The weeks-old "what causes the 9-28s spikes" question is answered. Proof: we swapped the LLM to
+Together AI and the silent end-of-call gaps VANISHED — `LLM_HTTP wall` = 1.5-4.0s with no stalls.
+So the gaps were Groq's per-minute/free-tier throttling (silent `langchain_groq` retry-backoff;
+`max_retries=2`, `request_timeout=None`). Opik, event-loop starvation, search, and generation are ALL
+exonerated as the gap cause. Don't re-litigate this.
 
-**What Jun 9 PROVED (don't re-litigate):**
-- Added `_log_groq_timing` in `fastrtc_agent.py` (logs Groq's `token_usage`: queue / prompt /
-  completion / total time + reasoning_tokens, per LLM call). Fires on every model step. It's wired
-  and live - nothing to add.
-- On a clean call, **every LLM call returned in total_time 0.17-1.24s** (queue <0.18s, prompt <0.7s,
-  completion <0.9s). So LLM token *generation* is fast. A 20s `ChatGroq` SPAN is therefore wall-clock
-  time spent on something OTHER than generating tokens.
+How we localized it (instrumentation now LIVE in `fastrtc_agent.py`, keep it):
+- `ASTREAM_TIMING` (astream invoke→first chunk), `LLM_HTTP wall` (full model call incl. retries, via
+  `_LLMTimingCallback`), `SEARCH_TIMING` (superlinked async_query), `TOOL_LOOP round=N` (tool rounds/turn),
+  `GROQ_TIMING` (Groq server-side; logs zeros on non-Groq providers, harmless).
+- Refuted along the way: "20-35s search" (was a one-off; search is 1.5-4.5s), event-loop starvation
+  (ASTREAM first_chunk was <1.8s early in calls), Opik.
 
-**What is still OPEN (do not claim resolved):**
-- We have **zero `GROQ_TIMING` lines from an actual spike turn** - the clean call didn't spike, and
-  the later calls hard-failed (see cap below) before generating. So the spike mechanism is unproven.
-- Candidates, none confirmed: (a) per-MINUTE rate-limit (TPM/RPM) retry-backoff inside `langchain_groq`
-  - fits the cross-day pattern; (b) **event-loop starvation** inflating the awaited span - this
-  codebase HAD an emit-queue starvation bug (see `docs/fastrtc-emit-queue-upstream.md`); (c) network stalls.
-- ⚠️ Earlier today this doc/memory briefly claimed the spikes were "rate-limit retries / daily-cap
-  depletion." That was an OVERREACH (the daily cap resets daily, can't explain low-volume-day spikes).
-  Ryan caught it. Stay honest: generation-is-fast is proven; the spike cause is not.
+**Jun 10 PM — Together LLM swap attempted, NOT clean. Two blockers (this is why we're trying ChatTogether):**
+1. **Harmony channel leak (reproducible):** via langchain `ChatOpenAI`→Together, gpt-oss's `analysis`
+   (reasoning) + `final` channel markers leak INTO `msg.content` on TOOL turns (e.g.
+   "We need to wait for tool response.Sure thing!..." / "finalSounds like a winner..."). Bare chat is
+   clean; only tool/search turns leak. NO separate clean field. = the "Leo speaks his thoughts" bug that
+   `reasoning_format="hidden"` fixed on Groq (Groq-only param, unsupported on Together).
+2. **Intermittent 400 "Input validation error"** from Together on some turns (killed a live call on turn 3;
+   instant reject, not a retry). NOT deterministic. Looks like flaky server-side harmony handling.
 
-**The decisive test (run tomorrow once Groq tokens reset):** make one longer call, let a turn spike
-to ~15-20s, then read that turn's `GROQ_TIMING` line:
-`docker logs phone-calling-agent-api 2>&1 | grep GROQ_TIMING`
-- spike span with **total_time ≈ 0.5s** → the time is NOT in Groq → it's retry-backoff or loop-stall
-  → next look: `langchain_groq` retry/max_retries config + the async emit loop.
-- spike span with **completion_time ≈ 20s** → it really is generation → revisit generation/model.
+**Plan for ChatTogether tomorrow:**
+- `uv add langchain-together` (note: pip-installing langchain-openai today bumped langchain-core 1.0.5→1.4.4
+  and openai 2.8→2.41 in the RUNNING CONTAINER only — not in the image; a clean `uv sync`/rebuild may be
+  wanted). Add a `chattogether` branch to `_build_llm()` in `fastrtc_agent.py`.
+- TEST THE CHANNEL FIRST (don't waste a phone call): run a tool round-trip and check `msg.content` is the
+  clean final answer with NO "final"/analysis leak (the repro that exposed it: bind `search_property_tool`,
+  ainvoke a property query, feed a ToolMessage back, inspect `.content`). If clean → wire it on and do a
+  live call, watch for the intermittent 400. If ALSO dirty → fall back to Groq + trim per-turn history.
 
-**⚠️ Groq FREE-TIER daily cap (hit Jun 9 ~21:14):** `openai/gpt-oss-120b` on-demand free tier =
-**200,000 tokens/day**. ~13 test calls exhausted it → hard 429s killed calls entirely. Token burn is
-high: every turn re-sends FULL conversation history (prompt_tok grew 1480→3350 within one call) on a
-reasoning model. If testing is blocked tomorrow, either wait for reset or upgrade to Groq Dev tier.
-Trimming per-turn history is a separate lever worth considering regardless.
+**Code state (all WORKING-TREE, uncommitted):** provider switch `settings.llm_provider` (default reverted
+to `"groq"` so the agent is correct) + `settings.together_llm_model="openai/gpt-oss-120b"` + `_build_llm()`
+helper (ChatGroq vs ChatOpenAI) + the timing logs above + `_LLMTimingCallback`. Flip `LLM_PROVIDER=together`
+env to re-enable the (still-dirty) Together path. `langchain-openai>=0.3.0` added to `pyproject.toml`.
+
+**⚠️ Groq FREE-TIER daily cap:** `openai/gpt-oss-120b` free tier = **200,000 tokens/day**, hit AGAIN
+Jun 10 on a handful of calls (huge burn: every turn re-sends FULL history on a reasoning model, prompt_tok
+1467→3575 in one call). Groq **Dev-tier upgrade is "temporarily unavailable due to high demand"** (Nvidia
+acquisition wind-down) — that's WHY we're moving to Together. Trimming per-turn history is the Groq-side
+fallback lever (cuts the cap + TPM-throttle root cause); decided window ≈ last 16 messages, prune old
+ToolMessages past the last 2 turns — not yet implemented.
 
 **Other confirmed latency facts (Jun 9 span breakdown, `/tmp/span_breakdown.py`):**
 - **TTS (Cartesia) is the only consistent latency floor:** ~5s mean on EVERY turn, spiking to

@@ -8,7 +8,9 @@ from fastrtc.reply_on_pause import AlgoOptions
 from fastrtc.utils import get_current_context
 from realtime_phone_agents.agent.stream import VoiceAgentStream
 from langchain.agents import create_agent
+from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
 from loguru import logger
 from opik.integrations.langchain import OpikTracer
@@ -24,6 +26,42 @@ from realtime_phone_agents.tts import get_tts_model
 from realtime_phone_agents.avatars.registry import get_avatar
 
 AudioChunk = Tuple[int, np.ndarray]  # (sample_rate, samples)
+
+
+class _LLMTimingCallback(BaseCallbackHandler):
+    """Times the full model HTTP call from start to end.
+
+    on_(chat_model|llm)_start -> on_llm_end brackets the entire langchain_groq
+    invocation INCLUDING any internal retry/backoff on 429 rate-limits. Compared
+    against GROQ_TIMING (server-side ~0.3s) and ASTREAM_TIMING (invoke->first
+    chunk), this splits the silent end-of-call gap:
+      - LLM_HTTP wall ≈ ASTREAM gap  -> time is in the Groq HTTP client
+        (rate-limit retry/backoff or network), not generation.
+      - LLM_HTTP wall ≈ 0.5s but ASTREAM big -> time is OUTSIDE the LLM call
+        (Opik callback/decorator or chain overhead).
+    """
+
+    def __init__(self) -> None:
+        self._starts: dict = {}
+
+    def on_chat_model_start(self, serialized, messages, *, run_id=None, **kwargs):
+        self._starts[run_id] = time.monotonic()
+
+    def on_llm_start(self, serialized, prompts, *, run_id=None, **kwargs):
+        self._starts[run_id] = time.monotonic()
+
+    def on_llm_end(self, response, *, run_id=None, **kwargs):
+        t0 = self._starts.pop(run_id, None)
+        if t0 is not None:
+            logger.info(f"LLM_HTTP wall={time.monotonic() - t0:.3f}s")
+
+    def on_llm_error(self, error, *, run_id=None, **kwargs):
+        t0 = self._starts.pop(run_id, None)
+        if t0 is not None:
+            logger.warning(
+                f"LLM_HTTP error wall={time.monotonic() - t0:.3f}s "
+                f"{type(error).__name__}: {error}"
+            )
 
 
 class FastRTCAgent:
@@ -66,7 +104,9 @@ class FastRTCAgent:
             tags=["fastrtc-agent", "realtime-phone"],
             thread_id=thread_id,
         )
-        
+        # Times the raw model HTTP call (incl. retries) to isolate the silent gap
+        self._llm_timing_cb = _LLMTimingCallback()
+
         # Dependency injection with sensible defaults
         self._stt_model = stt_model or get_stt_model(settings.stt_model)
         self._tts_model = tts_model or get_tts_model(settings.tts_model)
@@ -127,6 +167,45 @@ class FastRTCAgent:
             logger.error(f"Failed to pre-generate greeting audio: {e}")
             return None
 
+    def _build_llm(self):
+        """Build the conversational LLM for the configured provider.
+
+        Provider switch (settings.llm_provider):
+          - "together": Together AI's OpenAI-compatible endpoint via ChatOpenAI.
+            Together hosts the SAME model id (openai/gpt-oss-120b). It does NOT
+            support Groq's `reasoning_format` param — but it doesn't need it:
+            Together returns the gpt-oss reasoning in a SEPARATE `reasoning` field,
+            so `content` (read by _extract_final_text) is already the clean final
+            answer and the "Leo speaks his thoughts" leak does not recur. Moving off
+            Groq's throttled free tier is also the fix/A-B test for the silent
+            end-of-call latency gaps (suspected 429 retry-backoff).
+          - "groq": original ChatGroq path, kept as a fallback.
+
+        Shared: temperature/frequency_penalty/max_retries match the prior tuning.
+        max_tokens is a runaway backstop only (set high enough to never truncate a
+        real answer); bumped to 1024 on Together since reasoning-token accounting
+        against the cap differs from Groq and we don't want a mid-call truncation.
+        """
+        if settings.llm_provider == "groq":
+            return ChatGroq(
+                model=settings.groq.model,
+                api_key=settings.groq.api_key,
+                reasoning_format="hidden",
+                temperature=0.5,
+                max_tokens=512,
+                model_kwargs={"frequency_penalty": 0.6},
+            )
+
+        return ChatOpenAI(
+            model=settings.together_llm_model,
+            api_key=settings.together.api_key,
+            base_url=settings.together.api_url,
+            temperature=0.5,
+            max_tokens=1024,
+            frequency_penalty=0.6,
+            max_retries=2,
+        )
+
     def _create_react_agent(
         self,
         system_prompt: str | None = None,
@@ -142,36 +221,7 @@ class FastRTCAgent:
         Returns:
             Configured LangChain agent
         """
-        llm = ChatGroq(
-            model=settings.groq.model,
-            api_key=settings.groq.api_key,
-            # reasoning_format="hidden" is the real fix for the "repetition" /
-            # "Leo spoke his thoughts" bug. gpt-oss is a harmony-format reasoning
-            # model with separate analysis + final channels; with reasoning_format
-            # unset, Groq concatenates the analysis channel INTO content, so
-            # _extract_final_text (which reads msg.content) fed Leo's scratchpad to
-            # TTS ("We need to respond with something? ... The guidelines: try a
-            # different angle." / "(Waiting for your reply…)"). "hidden" strips the
-            # analysis channel so only the final answer is spoken. This supersedes
-            # the earlier frequency_penalty/temperature anti-repetition attempt —
-            # those can't fix a channel-separation leak.
-            reasoning_format="hidden",
-            # NOTE: reasoning_effort="low" was tried Jun 9 and REVERTED — it did NOT
-            # reduce the LLM latency spikes (worst ChatGroq turn got WORSE: 13s → 23s)
-            # and degraded quality (SMS misfired, Leo faltered late in calls). The 20s+
-            # spikes appear on the LAST turns of longer calls, which points more at
-            # Groq-side queueing/rate-limiting than at reasoning token volume — needs the
-            # Groq x-groq queue_time vs completion_time metadata to confirm before the
-            # next attempt. See [[leo-latency-and-repetition-findings]].
-            # max_tokens is a runaway backstop only: gpt-oss reasoning tokens count
-            # toward this cap, so it is set high enough to never truncate a real
-            # answer while still stopping infinite output.
-            temperature=0.5,
-            max_tokens=512,
-            model_kwargs={
-                "frequency_penalty": 0.6,
-            },
-        )
+        llm = self._build_llm()
 
         tools = tools or [search_property_tool]
 
@@ -339,15 +389,26 @@ class FastRTCAgent:
             logger.info("Prepended greeting to first turn messages")
         messages.append({"role": "user", "content": transcription})
 
-        # Stream LangChain agent updates with Opik tracing
+        # Stream LangChain agent updates with Opik tracing.
+        # ASTREAM_TIMING: measure wall-clock from invoking the agent to the first
+        # streamed chunk. Compared against GROQ_TIMING (server-side ~0.4s), a large
+        # delta here proves the gap is event-loop starvation, not Groq generation.
+        _astream_start = time.monotonic()
+        _first_chunk_logged = False
+        _tool_round = 0
         async for chunk in self._react_agent.astream(
             {"messages": messages},
             {
                 "configurable": {"thread_id": self._thread_id},
-                "callbacks": [self._opik_tracer]
+                "callbacks": [self._opik_tracer, self._llm_timing_cb]
             },
             stream_mode="updates",
         ):
+            if not _first_chunk_logged:
+                _first_chunk_logged = True
+                logger.info(
+                    f"ASTREAM_TIMING first_chunk={time.monotonic() - _astream_start:.3f}s"
+                )
             for step, data in chunk.items():
                 # Log Groq server-side timing for every LLM call (a tool turn
                 # makes two, so this fires per-call, not per-turn).
@@ -360,6 +421,12 @@ class FastRTCAgent:
                 if step == "model" and model_has_tool_calls(data):
                     tool_names = get_tool_call_names(data)
                     is_sms = any(n == "send_sms" for n in tool_names)
+
+                    # TOOL_LOOP: count tool-call rounds within a single turn.
+                    # >1 means the agent re-queried (the multi-search loop that
+                    # stacked ~25s searches into a minute of dead air).
+                    _tool_round += 1
+                    logger.info(f"TOOL_LOOP round={_tool_round} tools={tool_names}")
 
                     if not spoke_tool_message:
                         spoke_tool_message = True
