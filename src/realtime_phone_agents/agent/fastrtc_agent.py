@@ -227,54 +227,24 @@ class FastRTCAgent:
             return None
 
     def _build_llm(self):
-        """Build the conversational LLM for the configured provider.
+        """Build the conversational LLM (Groq / gpt-oss-120b).
 
-        Provider switch (settings.llm_provider):
-          - "together": Together AI's OpenAI-compatible endpoint via ChatOpenAI.
-            Together hosts the SAME model id (openai/gpt-oss-120b). It does NOT
-            support Groq's `reasoning_format` param — but it doesn't need it:
-            Together returns the gpt-oss reasoning in a SEPARATE `reasoning` field,
-            so `content` (read by _extract_final_text) is already the clean final
-            answer and the "Leo speaks his thoughts" leak does not recur. Moving off
-            Groq's throttled free tier is also the fix/A-B test for the silent
-            end-of-call latency gaps (suspected 429 retry-backoff).
-          - "groq": original ChatGroq path, kept as a fallback.
-
-        Shared: temperature/frequency_penalty/max_retries match the prior tuning.
-        max_tokens is a runaway backstop only (set high enough to never truncate a
-        real answer); bumped to 1024 on Together since reasoning-token accounting
-        against the cap differs from Groq and we don't want a mid-call truncation.
+        request_timeout bounds each attempt so backoff can't stall the call
+        indefinitely (was None = unbounded). max_retries kept at 2; the groq SDK
+        logs each 429 retry (we raise its logger to INFO at import time), so a
+        rate-limit throttle shows up literally instead of as silent wall.
+        reasoning_format="hidden" keeps gpt-oss's reasoning channel out of the
+        spoken content. max_tokens is a runaway backstop, not a target.
         """
-        if settings.llm_provider == "groq":
-            # request_timeout bounds each attempt so backoff can't stall the call
-            # indefinitely (was None = unbounded). max_retries kept at 2; the groq
-            # SDK logs each 429 retry (we raise its logger to INFO at import time),
-            # so a throttle event now shows up literally instead of as silent wall.
-            return ChatGroq(
-                model=settings.groq.model,
-                api_key=settings.groq.api_key,
-                reasoning_format="hidden",
-                temperature=0.5,
-                max_tokens=512,
-                max_retries=2,
-                request_timeout=30.0,
-                model_kwargs={"frequency_penalty": 0.6},
-            )
-
-        # Lazy import: langchain_openai is only needed for the Together path and is
-        # not in the built image (pip-installed into the container ad hoc on Jun 10,
-        # lost on recreate). Importing at module top crashed startup even on the
-        # default Groq path. Keep it scoped to the branch that actually uses it.
-        from langchain_openai import ChatOpenAI
-
-        return ChatOpenAI(
-            model=settings.together_llm_model,
-            api_key=settings.together.api_key,
-            base_url=settings.together.api_url,
+        return ChatGroq(
+            model=settings.groq.model,
+            api_key=settings.groq.api_key,
+            reasoning_format="hidden",
             temperature=0.5,
-            max_tokens=1024,
-            frequency_penalty=0.6,
+            max_tokens=512,
             max_retries=2,
+            request_timeout=30.0,
+            model_kwargs={"frequency_penalty": 0.6},
         )
 
     def _create_react_agent(

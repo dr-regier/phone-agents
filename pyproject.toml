@@ -12,7 +12,6 @@ dependencies = [
     "inquirer>=3.4.1",
     "langchain>=1.0.7",
     "langchain-groq>=1.0.1",
-    "langchain-openai>=0.3.0",
     "loguru>=0.7.3",
     "openai>=2.8.0",
     "opik>=1.9.40",

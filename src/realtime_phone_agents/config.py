@@ -126,18 +126,6 @@ class Settings(BaseSettings):
     opik: OpikSettings = Field(default_factory=OpikSettings)
     twilio: TwilioSettings = Field(default_factory=TwilioSettings)
 
-    # Provider for the conversational LLM. "together" routes the agent to
-    # Together AI's OpenAI-compatible endpoint (reuses together.api_key /
-    # together.api_url); "groq" keeps the original ChatGroq path as fallback.
-    llm_provider: str = Field(
-        default="groq",
-        description="Conversational LLM provider: together | groq",
-    )
-    together_llm_model: str = Field(
-        default="openai/gpt-oss-120b",
-        description="Together AI model id for the conversational LLM",
-    )
-
     # Per-call cap on conversation-history tokens sent to the LLM (system prompt
     # and tool schemas are separate and not counted here). Full history is still
     # retained in the checkpointer; this only trims what each model call SEES, to
