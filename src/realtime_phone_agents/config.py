@@ -138,6 +138,16 @@ class Settings(BaseSettings):
         description="Together AI model id for the conversational LLM",
     )
 
+    # Per-call cap on conversation-history tokens sent to the LLM (system prompt
+    # and tool schemas are separate and not counted here). Full history is still
+    # retained in the checkpointer; this only trims what each model call SEES, to
+    # cut token burn that drives the per-minute rate-limit retry/backoff (the
+    # silent 10-30s end-of-call gaps). Lower = safer from throttling, less context.
+    history_trim_max_tokens: int = Field(
+        default=1024,
+        description="Max conversation-history tokens sent per LLM call (0 disables trimming)",
+    )
+
     stt_model: str = Field(
         default="whisper-groq",
         description="STT model to use (moonshine, whisper-groq, faster-whisper)",

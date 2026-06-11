@@ -8,9 +8,11 @@ from fastrtc.reply_on_pause import AlgoOptions
 from fastrtc.utils import get_current_context
 from realtime_phone_agents.agent.stream import VoiceAgentStream
 from langchain.agents import create_agent
+from langchain.agents.middleware import wrap_model_call
 from langchain_core.callbacks.base import BaseCallbackHandler
+from langchain_core.messages import trim_messages
+from langchain_core.messages.utils import count_tokens_approximately
 from langchain_groq import ChatGroq
-from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
 from loguru import logger
 from opik.integrations.langchain import OpikTracer
@@ -26,6 +28,25 @@ from realtime_phone_agents.tts import get_tts_model
 from realtime_phone_agents.avatars.registry import get_avatar
 
 AudioChunk = Tuple[int, np.ndarray]  # (sample_rate, samples)
+
+# Surface the groq SDK's retry/backoff. It logs "Retrying request ... in N
+# seconds" at INFO on each 429. The app uses loguru, so the stdlib root logger
+# has NO handler — setLevel alone gets dropped (stdlib's fallback only emits at
+# WARNING). Attach a dedicated stderr handler to the "groq" logger so a
+# rate-limit throttle shows up literally instead of only as inflated LLM_HTTP
+# wall. propagate=False avoids any double-emit if a root handler appears later.
+import logging
+import sys
+
+_groq_log = logging.getLogger("groq")
+_groq_log.setLevel(logging.INFO)
+if not any(getattr(h, "_groq_retry_sink", False) for h in _groq_log.handlers):
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setLevel(logging.INFO)
+    _h.setFormatter(logging.Formatter("GROQ_SDK %(levelname)s %(name)s: %(message)s"))
+    _h._groq_retry_sink = True
+    _groq_log.addHandler(_h)
+    _groq_log.propagate = False
 
 
 class _LLMTimingCallback(BaseCallbackHandler):
@@ -62,6 +83,44 @@ class _LLMTimingCallback(BaseCallbackHandler):
                 f"LLM_HTTP error wall={time.monotonic() - t0:.3f}s "
                 f"{type(error).__name__}: {error}"
             )
+
+
+@wrap_model_call
+async def _trim_history_middleware(request, handler):
+    """Trim conversation history to a token budget before each model call.
+
+    Full history stays in the checkpointer (memory is preserved); this only
+    caps what each LLM call SEES. Re-sending the whole transcript every turn is
+    what drives prompt_tok up (1466->4146 in one call) and pushes us into the
+    per-minute rate limit, whose retry/backoff is the silent 10-30s end-of-call
+    gap (see LLM_HTTP wall >> GROQ server-side time). System prompt and tool
+    schemas are separate ModelRequest fields, so they're untouched here.
+
+    HISTORY_TRIM logs before/after so the effect is visible next to LLM_HTTP.
+    """
+    budget = settings.history_trim_max_tokens
+    if budget <= 0:
+        return await handler(request)
+
+    msgs = request.messages
+    before_tok = count_tokens_approximately(msgs)
+    trimmed = trim_messages(
+        msgs,
+        max_tokens=budget,
+        token_counter=count_tokens_approximately,
+        strategy="last",
+        start_on="human",        # never begin on an orphan AI/Tool message
+        end_on=("human", "tool"),  # keep a complete trailing tool sequence
+        include_system=False,      # system prompt is a separate request field
+        allow_partial=False,
+    )
+    if len(trimmed) < len(msgs):
+        logger.info(
+            f"HISTORY_TRIM msgs {len(msgs)}->{len(trimmed)} "
+            f"approx_tok {before_tok}->{count_tokens_approximately(trimmed)} "
+            f"(budget={budget})"
+        )
+    return await handler(request.override(messages=trimmed))
 
 
 class FastRTCAgent:
@@ -187,14 +246,26 @@ class FastRTCAgent:
         against the cap differs from Groq and we don't want a mid-call truncation.
         """
         if settings.llm_provider == "groq":
+            # request_timeout bounds each attempt so backoff can't stall the call
+            # indefinitely (was None = unbounded). max_retries kept at 2; the groq
+            # SDK logs each 429 retry (we raise its logger to INFO at import time),
+            # so a throttle event now shows up literally instead of as silent wall.
             return ChatGroq(
                 model=settings.groq.model,
                 api_key=settings.groq.api_key,
                 reasoning_format="hidden",
                 temperature=0.5,
                 max_tokens=512,
+                max_retries=2,
+                request_timeout=30.0,
                 model_kwargs={"frequency_penalty": 0.6},
             )
+
+        # Lazy import: langchain_openai is only needed for the Together path and is
+        # not in the built image (pip-installed into the container ad hoc on Jun 10,
+        # lost on recreate). Importing at module top crashed startup even on the
+        # default Groq path. Keep it scoped to the branch that actually uses it.
+        from langchain_openai import ChatOpenAI
 
         return ChatOpenAI(
             model=settings.together_llm_model,
@@ -230,6 +301,7 @@ class FastRTCAgent:
             checkpointer=self._checkpointer,
             system_prompt=system_prompt,
             tools=tools,
+            middleware=[_trim_history_middleware],
         )
         return agent
 
