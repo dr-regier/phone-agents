@@ -144,7 +144,7 @@ class Settings(BaseSettings):
     # cut token burn that drives the per-minute rate-limit retry/backoff (the
     # silent 10-30s end-of-call gaps). Lower = safer from throttling, less context.
     history_trim_max_tokens: int = Field(
-        default=1024,
+        default=512,
         description="Max conversation-history tokens sent per LLM call (0 disables trimming)",
     )
 
