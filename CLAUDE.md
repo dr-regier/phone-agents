@@ -15,7 +15,8 @@ from scratch. All avatars (leo, dan, jess, leah, mia, tara, zac, zoe) are course
 
 ## Current State
 - Leo runs locally on Ryan's machine (not cloud-deployed)
-- Last tested March 21, 2026 - everything working well
+- Last worked Jun 11, 2026 - end-of-call latency RESOLVED (Groq free-tier TPM throttle, fixed via
+  per-call history trimming). See `docs/revisit-2026-05-notes.md` "START HERE" for status + next task.
 - Only Leo is registered in the avatar registry
 
 ## Strategic Value

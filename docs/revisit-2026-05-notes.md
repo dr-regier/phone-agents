@@ -7,65 +7,50 @@
 
 ---
 
-## ▶ START HERE NEXT SESSION (last worked: Jun 10 2026 evening)
+## ▶ START HERE NEXT SESSION (last worked: Jun 11 2026)
 
-**🎯 NEXT TASK: try `langchain-together` (ChatTogether) for the conversational LLM.** The latency
-mystery is SOLVED (see below); the only open problem is getting clean Together output. ChatTogether is
-the one shot at a fully-clean win (fast + correct + escapes the Groq cap).
+**✅ END-OF-CALL LATENCY: FULLY RESOLVED + MERGED TO MAIN (Jun 11).** The weeks-old "what causes the
+9-31s end-of-call gaps" question is closed and FIXED. Don't re-litigate or re-investigate it.
+- **Root cause (convicted red-handed):** Groq FREE-TIER per-minute rate limit (TPM). Deep into a call,
+  cumulative tokens/min cross the limit → 429 → the groq SDK retries with exponential backoff (1→3→8→8s) →
+  that backoff IS the silent gap. Proof: with retry logging on, `GROQ_SDK ... Retrying request ... in Ns`
+  lines matched the inflated `LLM_HTTP wall` exactly, while server-side generation stayed <1s every time.
+  (The Jun 10 Together "confirmation" was weak — Together died at turn 3 so we'd only compared its good
+  early turns vs Groq's bad late turns. This session got the clean Groq-side proof.)
+- **The fix (all on main):** per-call conversation history is trimmed to a token budget so cumulative
+  TPM stays under the ceiling. `_trim_history_middleware` (async `@wrap_model_call`) +
+  `settings.history_trim_max_tokens=512` + condensed `search_property_tool` docstring (rides in the tool
+  schema every call). Result on a 23-turn / ~5-min validation call: **ZERO retries, max LLM_HTTP wall
+  1.46s, prompt_tok plateaus ~1700** (was climbing to 4146). Leo held context fine at 512.
+  Also added: `request_timeout=30.0`/`max_retries=2` on the Groq client, and a dedicated stderr handler on
+  the `groq` stdlib logger so retries are visible (loguru app → stdlib root has no handler).
+- **Together AI: REMOVED, do NOT revisit.** It was only an A/B probe. It reintroduced the gpt-oss harmony
+  channel leak (analysis/final markers bleed into `content` on tool turns) + intermittent 400s. Scaffolding
+  (`settings.llm_provider`, `_build_llm` branch, `langchain-openai` dep) was stripped in commit `bad7c0f`.
 
-**✅ LATENCY MYSTERY SOLVED Jun 10 PM — it was Groq rate-limit throttling.**
-The weeks-old "what causes the 9-28s spikes" question is answered. Proof: we swapped the LLM to
-Together AI and the silent end-of-call gaps VANISHED — `LLM_HTTP wall` = 1.5-4.0s with no stalls.
-So the gaps were Groq's per-minute/free-tier throttling (silent `langchain_groq` retry-backoff;
-`max_retries=2`, `request_timeout=None`). Opik, event-loop starvation, search, and generation are ALL
-exonerated as the gap cause. Don't re-litigate this.
+**Instrumentation is LIVE in `fastrtc_agent.py` (keep it):** `ASTREAM_TIMING`, `LLM_HTTP wall`
+(`_LLMTimingCallback`), `SEARCH_TIMING`, `TOOL_LOOP round=N`, `GROQ_TIMING`, `HISTORY_TRIM`, and the
+`GROQ_SDK ... Retrying request` retry log. Refuted along the way (don't re-chase): event-loop starvation,
+Opik upload, "20-35s search" (search is 1.5-4.5s), generation itself.
 
-How we localized it (instrumentation now LIVE in `fastrtc_agent.py`, keep it):
-- `ASTREAM_TIMING` (astream invoke→first chunk), `LLM_HTTP wall` (full model call incl. retries, via
-  `_LLMTimingCallback`), `SEARCH_TIMING` (superlinked async_query), `TOOL_LOOP round=N` (tool rounds/turn),
-  `GROQ_TIMING` (Groq server-side; logs zeros on non-Groq providers, harmless).
-- Refuted along the way: "20-35s search" (was a one-off; search is 1.5-4.5s), event-loop starvation
-  (ASTREAM first_chunk was <1.8s early in calls), Opik.
+**🎯 NEXT TASK (pick one — latency saga is done, these are fresh):**
+1. **TTS streaming — the now-dominant latency floor.** Cartesia (via Together) is non-streaming: ~5s mean
+   on EVERY turn, 9.5-11.3s on long property readouts, because audio waits for the full clip. With the LLM
+   gaps gone, this is the single biggest remaining wait on a normal turn. Candidate: switch Cartesia to
+   streaming so audio starts before the clip finishes. Bigger change but the real average-latency win.
+2. **(Optional) Paid Groq tier** — only if a future marathon call (20+ turns) needs more TPM headroom than
+   the 512 budget gives. Removes the ceiling entirely. Re-check if Dev tier is purchasable again
+   post-acquisition. Not needed for current usage.
+3. **(Tuning) history budget** — 512 is locked and Leo stayed coherent; nudge toward 768 only if he ever
+   feels forgetful on long calls (`settings.history_trim_max_tokens`).
 
-**Jun 10 PM — Together LLM swap attempted, NOT clean. Two blockers (this is why we're trying ChatTogether):**
-1. **Harmony channel leak (reproducible):** via langchain `ChatOpenAI`→Together, gpt-oss's `analysis`
-   (reasoning) + `final` channel markers leak INTO `msg.content` on TOOL turns (e.g.
-   "We need to wait for tool response.Sure thing!..." / "finalSounds like a winner..."). Bare chat is
-   clean; only tool/search turns leak. NO separate clean field. = the "Leo speaks his thoughts" bug that
-   `reasoning_format="hidden"` fixed on Groq (Groq-only param, unsupported on Together).
-2. **Intermittent 400 "Input validation error"** from Together on some turns (killed a live call on turn 3;
-   instant reject, not a retry). NOT deterministic. Looks like flaky server-side harmony handling.
-
-**Plan for ChatTogether tomorrow:**
-- `uv add langchain-together` (note: pip-installing langchain-openai today bumped langchain-core 1.0.5→1.4.4
-  and openai 2.8→2.41 in the RUNNING CONTAINER only — not in the image; a clean `uv sync`/rebuild may be
-  wanted). Add a `chattogether` branch to `_build_llm()` in `fastrtc_agent.py`.
-- TEST THE CHANNEL FIRST (don't waste a phone call): run a tool round-trip and check `msg.content` is the
-  clean final answer with NO "final"/analysis leak (the repro that exposed it: bind `search_property_tool`,
-  ainvoke a property query, feed a ToolMessage back, inspect `.content`). If clean → wire it on and do a
-  live call, watch for the intermittent 400. If ALSO dirty → fall back to Groq + trim per-turn history.
-
-**Code state (all WORKING-TREE, uncommitted):** provider switch `settings.llm_provider` (default reverted
-to `"groq"` so the agent is correct) + `settings.together_llm_model="openai/gpt-oss-120b"` + `_build_llm()`
-helper (ChatGroq vs ChatOpenAI) + the timing logs above + `_LLMTimingCallback`. Flip `LLM_PROVIDER=together`
-env to re-enable the (still-dirty) Together path. `langchain-openai>=0.3.0` added to `pyproject.toml`.
-
-**⚠️ Groq FREE-TIER daily cap:** `openai/gpt-oss-120b` free tier = **200,000 tokens/day**, hit AGAIN
-Jun 10 on a handful of calls (huge burn: every turn re-sends FULL history on a reasoning model, prompt_tok
-1467→3575 in one call). Groq **Dev-tier upgrade is "temporarily unavailable due to high demand"** (Nvidia
-acquisition wind-down) — that's WHY we're moving to Together. Trimming per-turn history is the Groq-side
-fallback lever (cuts the cap + TPM-throttle root cause); decided window ≈ last 16 messages, prune old
-ToolMessages past the last 2 turns — not yet implemented.
-
-**Other confirmed latency facts (Jun 9 span breakdown, `/tmp/span_breakdown.py`):**
-- **TTS (Cartesia) is the only consistent latency floor:** ~5s mean on EVERY turn, spiking to
-  9.5-11.3s on long readouts. Non-streaming. This is the real, always-present lever once the spike
-  question is closed - candidate: switch Cartesia to streaming.
-- `search_property_tool` is ~1.2-2.5s, NOT a bottleneck (the old "search regressed to 5-14s" claim
-  was wrong - that time was the LLM, not search). STT ~1s, fine.
-- **`reasoning_effort="low"` was TRIED + REVERTED Jun 9.** Degraded quality in 3 live calls (SMS
-  misfired, Leo faltered late). Its latency rationale is moot until the spike mechanism is known.
-  Only a NOTE comment remains in `fastrtc_agent.py` (~line 159).
+**Reference — other confirmed latency facts (Jun 9 span breakdown):**
+- `search_property_tool` ~1.2-2.5s, NOT a bottleneck. STT ~1s, fine.
+- **`reasoning_effort="low"` was TRIED + REVERTED Jun 9** — degraded quality (SMS misfired, Leo faltered
+  late). Available as a TPM lever if ever needed, but only with a quality re-test. NOTE comment remains in
+  `fastrtc_agent.py`.
+- **Housekeeping:** `uv.lock` not regenerated after dropping `langchain-openai`; run `uv lock` on next
+  image rebuild (harmless until then).
 
 **Done & shipped (Jun 8):**
 - ✅ **Repetition / "Leo spoke his thoughts" bug FIXED + validated** (commit `779718c`). Root cause was
